@@ -3,8 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "消息网关模拟器（切片 1 完整实现；当前为占位）",
+  "description": "消息网关模拟器：忠实实现题面 §2.1 的全部接口、时序与故障行为",
   "scripts": {
-    "start": "node src/server.js"
-  }
+    "start": "node src/index.js",
+    "selftest": "node scripts/selftest.js"
+  },
+  "dependencies": {}
 }
