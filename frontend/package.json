@@ -1,0 +1,10 @@
+{
+  "name": "@platform/frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "操作控制台前端（切片 5 完整实现；当前为占位）",
+  "scripts": {
+    "start": "node src/server.js"
+  }
+}

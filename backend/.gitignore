@@ -1,0 +1,10 @@
+# backend 子包忽略规则
+node_modules/
+dist/
+coverage/
+*.log
+
+# 本包自带 .env（本地开发用），不提交
+.env
+.env.*
+!.env.example

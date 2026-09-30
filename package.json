@@ -1,0 +1,8 @@
+{
+  "name": "multi-account-message-platform",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "frontend"
+  ]
+}

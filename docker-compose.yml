@@ -1,0 +1,88 @@
+# 一键部署：docker compose up --build
+#
+# 服务一览
+#   db            PostgreSQL 16，带健康检查；数据存 named volume
+#   backend       后端 API；启动前自动执行 migration，schema 落后则拒绝启动
+#   gateway-mock  消息网关模拟器（切片 1 实现，当前为占位）
+#   agent-mock    Agent 服务模拟器（切片 5 实现，当前为占位）
+#   frontend      控制台前端（切片 5 实现，当前为占位）
+#
+# 端口映射（宿主机 → 容器）
+#   3000 → backend      后端 API
+#   5432 → db           PostgreSQL（宿主机脚本可直连）
+#   3100 → gateway-mock 消息网关
+#   3200 → agent-mock   Agent 服务
+#   5173 → frontend     前端开发服务器
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # 健康检查通过后，backend 才会启动（见 depends_on.condition）
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      PORT: "3000"
+      # 容器内用服务名 db 访问数据库
+      DATABASE_URL: postgres://app:app@db:5432/app
+      GATEWAY_URL: http://gateway-mock:3100
+      AGENT_URL: http://agent-mock:3200
+      # 仅供本地演示；面试官无需修改。生产环境应通过 secret 注入。
+      JWT_SECRET: dev-only-insecure-secret-change-me
+      ACCESS_TOKEN_TTL_SECONDS: "900"
+      LOG_LEVEL: info
+    # 先跑 migration，再启动服务；migration 可重复执行
+    command: sh -c "node dist/db/migrate-cli.js up && node dist/index.js"
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- 以下三个服务当前为占位，后续切片替换 ---
+
+  gateway-mock:
+    build:
+      context: ./gateway-mock
+    environment:
+      PORT: "3100"
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
+
+  agent-mock:
+    build:
+      context: ./agent-mock
+    environment:
+      PORT: "3200"
+    ports:
+      - "3200:3200"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      PORT: "5173"
+    ports:
+      - "5173:5173"
+    restart: unless-stopped
+
+volumes:
+  pgdata:

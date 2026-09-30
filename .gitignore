@@ -1,11 +1,22 @@
-node_modules
-dist
-build
-coverage
+# 根目录忽略规则（各子包的 .gitignore 见 backend/ frontend/）
+
+# 依赖与产物
+node_modules/
+dist/
+build/
+coverage/
+
+# 环境变量与密钥：绝不提交
 .env
 .env.*
 !.env.example
+
+# 运行时产生的数据
 media/
 pgdata/
 *.log
+
+# 编辑器 / 系统
 .DS_Store
+.idea/
+.vscode/
