@@ -97,6 +97,8 @@ export async function runAgent(deps: AgentRunnerDeps, runId: string): Promise<vo
   let consecutiveProtocolErrors = 0;
   let stepNo = 0;
   const seenToolUseIds = new Set<string>();
+  // 重复 get_recent_messages 检测：记录上一次的入参 JSON
+  let lastGetRecentInput: string | null = null;
 
   // 恢复：从 agent_run_messages 重建 messages 数组
   const client = await pool.connect();
@@ -117,9 +119,22 @@ export async function runAgent(deps: AgentRunnerDeps, runId: string): Promise<vo
       content: m.blocks as AgentContentBlock[],
     }));
 
+    // ---- 崩溃恢复：检查最后一条 assistant tool_use 是否有对应 tool_result ----
+    await recoverIncompleteToolUse(deps, client, run, messages);
+
     // 主循环
     while (run.status === 'running') {
       stepNo++;
+
+      // ---- 外部状态检查：群 unreachable 或 agentEnabled 关闭 → cancelled ----
+      const groupCheck = await deps.groupRepo.findById(run.groupId);
+      if (groupCheck === undefined || groupCheck.status === 'unreachable' || !groupCheck.agentEnabled) {
+        const reason = groupCheck?.status === 'unreachable' ? 'group_unreachable' : 'agent_disabled';
+        await agentRunRepo.finishRun(client, runId, 'cancelled', 'cancelled', null);
+        await enqueueWebEvent(client, 'agent_cancelled', { runId, groupId: run.groupId, reason });
+        log.info({ runId, reason }, 'agent: 群不可达或 agent 已关闭，run cancelled');
+        return;
+      }
 
       // ---- 预算检查 ----
       if (stepNo > MAX_STEPS) {
@@ -225,7 +240,14 @@ export async function runAgent(deps: AgentRunnerDeps, runId: string): Promise<vo
         // 执行工具（审计 3 次失败会抛 AuditBlockedError）
         let toolResult: ToolExecutionResult;
         try {
-          toolResult = await executeTool(deps, client, run, block);
+          toolResult = await executeTool(deps, client, run, block, lastGetRecentInput);
+          // 更新 get_recent_messages 入参记录
+          if (block.name === 'get_recent_messages') {
+            lastGetRecentInput = JSON.stringify(block.input);
+          } else if (block.name === 'send_message' || block.name === 'kick_user') {
+            // 其他工具重置，避免误判
+            lastGetRecentInput = null;
+          }
         } catch (err) {
           if (err instanceof AuditBlockedError) {
             // run → blocked，推事件通知操作员
@@ -240,7 +262,7 @@ export async function runAgent(deps: AgentRunnerDeps, runId: string): Promise<vo
         // 第 1 类协议错误（UNKNOWN_TOOL / INVALID_INPUT）：正常追加 is_error tool_result
         // 其他错误（NO_AVAILABLE_ACCOUNT / SEND_FAILED 等）也以 is_error tool_result 返回
         const isError = toolResult.isError;
-        const resultContent = truncate(JSON.stringify(toolResult.content), MAX_TOOL_RESULT_BYTES);
+        const resultContent = stringifyWithSizeLimit(toolResult.content, MAX_TOOL_RESULT_BYTES);
         const toolResultBlock: AgentContentBlock = {
           type: 'tool_result',
           tool_use_id: block.id,
@@ -254,7 +276,7 @@ export async function runAgent(deps: AgentRunnerDeps, runId: string): Promise<vo
           toolUseId: block.id,
           name: block.name,
           input: block.input,
-          resultSummary: truncate(resultContent, 200),
+          resultSummary: truncateChars(resultContent, 200),
           isError,
           errorCode: toolResult.errorCode ?? null,
           auditVerdict: toolResult.auditVerdict ?? null,
@@ -289,6 +311,78 @@ export async function runAgent(deps: AgentRunnerDeps, runId: string): Promise<vo
   }
 }
 
+/**
+ * 崩溃恢复：检查 messages 末尾是否有未配对的 assistant tool_use。
+ * 若有，根据 agent_tool_calls 状态判定是否已执行，回填 tool_result 或重放。
+ * 绝不重放已生效的调用（INV-3）。
+ */
+async function recoverIncompleteToolUse(
+  deps: AgentRunnerDeps,
+  client: PoolClient,
+  run: { id: string; groupId: string },
+  messages: AgentMessage[],
+): Promise<void> {
+  // 找最后一条 assistant 消息中的 tool_use 块
+  let lastToolUse: Extract<AgentContentBlock, { type: 'tool_use' }> | null = null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]!;
+    if (msg.role !== 'assistant') continue;
+    const blocks = Array.isArray(msg.content) ? msg.content : [];
+    const toolUse = blocks.find((b): b is Extract<AgentContentBlock, { type: 'tool_use' }> => b.type === 'tool_use');
+    if (toolUse !== undefined) {
+      lastToolUse = toolUse;
+      break;
+    }
+  }
+  if (lastToolUse === null) return;
+
+  // 检查是否已有对应的 tool_result
+  const hasResult = messages.some((m) => {
+    if (m.role !== 'user') return false;
+    const blocks = Array.isArray(m.content) ? m.content : [];
+    return blocks.some((b) => b.type === 'tool_result' && b.tool_use_id === lastToolUse!.id);
+  });
+  if (hasResult) return;
+
+  // 未配对 → 查 agent_tool_calls 判定
+  const toolCall = await deps.agentRunRepo.getToolCallByToolUseId(client, run.id, lastToolUse.id);
+
+  let result: ToolExecutionResult;
+  if (toolCall !== undefined && toolCall.state === 'executed') {
+    // 已执行 → 查 outbox 当前状态回填
+    const outbox = toolCall.outboxId !== null
+      ? await deps.outboxRepo.findById(toolCall.outboxId)
+      : undefined;
+    const status = outbox?.deliveryStatus ?? 'unknown';
+    result = { content: { status, clientMsgId: toolCall.idempotencyKey, recovered: true }, isError: false };
+  } else if (toolCall !== undefined && toolCall.state === 'pending_execution') {
+    // pending_execution → 检查 outbox 是否已存在（crash 在 enqueue 之后、mark 之前）
+    const outbox = await deps.outboxRepo.findByClientMsgId(toolCall.idempotencyKey);
+    if (outbox !== undefined) {
+      // 已入队但未标记 → 回填标记，返回状态
+      await deps.agentRunRepo.markToolCallExecuted(client, run.id, toolCall.idempotencyKey, outbox.id);
+      result = { content: { status: outbox.deliveryStatus, clientMsgId: toolCall.idempotencyKey, recovered: true }, isError: false };
+    } else {
+      // 未入队 → 重放执行
+      result = await executeTool(deps, client, run, lastToolUse, null);
+    }
+  } else {
+    // 无记录 → 重放执行（crash 在 recordToolCall 之前）
+    result = await executeTool(deps, client, run, lastToolUse, null);
+  }
+
+  // 回填 tool_result 到 messages 和 DB
+  const resultContent = stringifyWithSizeLimit(result.content, MAX_TOOL_RESULT_BYTES);
+  const toolResultBlock: AgentContentBlock = {
+    type: 'tool_result',
+    tool_use_id: lastToolUse.id,
+    content: resultContent,
+    is_error: result.isError,
+  };
+  messages.push({ role: 'user', content: [toolResultBlock] });
+  await deps.agentRunRepo.appendMessage(client, run.id, 'user', [toolResultBlock]);
+}
+
 /** 工具执行结果。 */
 interface ToolExecutionResult {
   readonly content: unknown;
@@ -311,12 +405,13 @@ async function executeTool(
   client: PoolClient,
   run: { id: string; groupId: string },
   block: Extract<AgentContentBlock, { type: 'tool_use' }>,
+  lastGetRecentInput: string | null,
 ): Promise<ToolExecutionResult> {
   const { name, input } = block;
 
   switch (name) {
     case 'get_recent_messages':
-      return execGetRecentMessages(deps, run.groupId, input);
+      return execGetRecentMessages(deps, run.groupId, input, lastGetRecentInput);
     case 'send_message':
       return execSendMessage(deps, client, run, block.id, input);
     case 'kick_user':
@@ -349,12 +444,26 @@ async function runAudit(
   throw new AuditBlockedError();
 }
 
-/** get_recent_messages：查 messages 表最近 limit 条。 */
+/**
+ * get_recent_messages：查 messages 表最近 limit 条。
+ * 连续第 2 次相同入参 → 返回 INVALID_INPUT 提示（规划 2.9）。
+ */
 async function execGetRecentMessages(
   deps: AgentRunnerDeps,
   groupId: string,
   input: Record<string, unknown>,
+  lastGetRecentInput: string | null,
 ): Promise<ToolExecutionResult> {
+  const currentInput = JSON.stringify(input);
+  // 连续第 2 次相同入参 → 提示性 INVALID_INPUT
+  if (lastGetRecentInput !== null && lastGetRecentInput === currentInput) {
+    return {
+      content: { error: 'INVALID_INPUT', hint: '重复调用 get_recent_messages，请基于已有信息决策' },
+      isError: true,
+      errorCode: 'INVALID_INPUT',
+    };
+  }
+
   const limit = typeof input['limit'] === 'number' ? Math.min(100, Math.max(1, input['limit'])) : 10;
   const page = await listTimeline(deps.pool, groupId, null, limit);
   return {
@@ -487,9 +596,29 @@ async function execKickUser(
   };
 }
 
-/** 截断字符串到 maxBytes 字节。 */
+/** 截断字符串到 maxBytes 字节（用于 rawResponse 等非 JSON 字段）。 */
 function truncate(s: string, maxBytes: number): string {
   const buf = Buffer.from(s, 'utf8');
   if (buf.length <= maxBytes) return s;
   return buf.subarray(0, maxBytes).toString('utf8');
+}
+
+/** 按字符数截断（用于 resultSummary ≤ 200 字）。 */
+function truncateChars(s: string, maxChars: number): string {
+  if (s.length <= maxChars) return s;
+  return s.slice(0, maxChars);
+}
+
+/**
+ * 序列化工具结果到 JSON，限制 maxBytes 字节。
+ * 超出时追加 truncated:true 标志后再截断（对齐规划 2.9）。
+ */
+function stringifyWithSizeLimit(content: unknown, maxBytes: number): string {
+  const raw = JSON.stringify(content);
+  if (Buffer.byteLength(raw, 'utf8') <= maxBytes) return raw;
+  // 注入 truncated 标志后再截断
+  const obj = (typeof content === 'object' && content !== null)
+    ? { ...(content as Record<string, unknown>), truncated: true }
+    : { value: content, truncated: true };
+  return truncate(JSON.stringify(obj), maxBytes);
 }

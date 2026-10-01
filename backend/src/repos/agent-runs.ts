@@ -266,19 +266,40 @@ export class AgentRunRepo {
     queryable: Queryable,
     runId: string,
     idempotencyKey: string,
-  ): Promise<{ outboxId: string | null; state: AgentToolCallState; toolUseId: string } | undefined> {
+  ): Promise<{ outboxId: string | null; state: AgentToolCallState; toolUseId: string; idempotencyKey: string } | undefined> {
     const { rows } = await queryable.query<{
       outbox_id: string | null;
       state: AgentToolCallState;
       tool_use_id: string;
+      idempotency_key: string;
     }>(
-      `SELECT outbox_id, state, tool_use_id FROM agent_tool_calls
+      `SELECT outbox_id, state, tool_use_id, idempotency_key FROM agent_tool_calls
        WHERE run_id = $1 AND idempotency_key = $2`,
       [runId, idempotencyKey],
     );
     const row = rows[0];
     if (row === undefined) return undefined;
-    return { outboxId: row.outbox_id, state: row.state, toolUseId: row.tool_use_id };
+    return { outboxId: row.outbox_id, state: row.state, toolUseId: row.tool_use_id, idempotencyKey: row.idempotency_key };
+  }
+
+  /** 按 tool_use_id 查工具调用记录（崩溃恢复时定位未完成的调用）。 */
+  async getToolCallByToolUseId(
+    queryable: Queryable,
+    runId: string,
+    toolUseId: string,
+  ): Promise<{ outboxId: string | null; state: AgentToolCallState; idempotencyKey: string } | undefined> {
+    const { rows } = await queryable.query<{
+      outbox_id: string | null;
+      state: AgentToolCallState;
+      idempotency_key: string;
+    }>(
+      `SELECT outbox_id, state, idempotency_key FROM agent_tool_calls
+       WHERE run_id = $1 AND tool_use_id = $2`,
+      [runId, toolUseId],
+    );
+    const row = rows[0];
+    if (row === undefined) return undefined;
+    return { outboxId: row.outbox_id, state: row.state, idempotencyKey: row.idempotency_key };
   }
 
   /** 记录一条工具调用为 pending_execution（审计通过后、执行前）。 */

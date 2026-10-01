@@ -66,8 +66,9 @@ function makeDeps(agentClient: AgentClientLike, groupGateway: GroupGateway = mak
   };
 }
 
-/** 创建一个 running 的 agent run。 */
+/** 创建一个 running 的 agent run（同时开启群的 agent_enabled）。 */
 async function createRunningRun(groupId: string): Promise<string> {
+  await pool.query(`UPDATE groups SET agent_enabled = true WHERE id = $1`, [groupId]);
   const { rows } = await pool.query<{ id: string }>(
     `INSERT INTO agent_runs (group_id, status) VALUES ($1, 'running') RETURNING id`,
     [groupId],
@@ -324,5 +325,155 @@ describe('AgentRunner F1', () => {
 
     const steps = await deps.agentRunRepo.listSteps(pool, runId);
     expect(steps[0]?.errorCode).toBe('NO_AVAILABLE_ACCOUNT');
+  });
+
+  // ---- F3：崩溃恢复 ----
+
+  it('崩溃恢复：executed 状态 → 回填 tool_result，不重发', async () => {
+    const { groupId } = await seedGroupWithMember('acct-1');
+    const runId = await createRunningRun(groupId);
+    const idemKey = '33333333-3333-3333-3333-333333333333';
+
+    // 模拟 crash 前状态：assistant tool_use 已持久化，tool_call 已 executed
+    const toolUseBlock: AgentContentBlock = { type: 'tool_use', id: 'tu-crash', name: 'send_message', input: { text: 'hi', idempotency_key: idemKey } };
+    {
+      const c = await pool.connect();
+      try {
+        await new AgentRunRepo(pool).appendMessage(c, runId, 'assistant', [toolUseBlock]);
+      } finally {
+        c.release();
+      }
+    }
+
+    // 手动插入 outbox + agent_tool_calls(executed)
+    const { rows: outboxRows } = await pool.query<{ id: string }>(
+      `INSERT INTO outbox_messages (group_id, account_id, client_msg_id, text, delivery_status, origin)
+       SELECT $1, (SELECT id FROM accounts WHERE account_id='acct-1'), $2, 'hi', 'sent', 'agent'
+       RETURNING id`,
+      [groupId, idemKey],
+    );
+    await pool.query(
+      `INSERT INTO agent_tool_calls (run_id, idempotency_key, outbox_id, tool_use_id, state)
+       VALUES ($1, $2, $3, 'tu-crash', 'executed')`,
+      [runId, idemKey, outboxRows[0]!.id],
+    );
+
+    // agent 第 2 轮直接 finish
+    const script: AgentMessage[] = [
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'tu2', name: 'finish', input: { summary: 'done' } }] },
+    ];
+    const deps = makeDeps(new MockAgentClient(script));
+    await runAgent(deps, runId);
+
+    // 不应重发：outbox 只有 1 条
+    const { rows } = await pool.query<{ count: string }>(
+      'SELECT COUNT(*)::text AS count FROM outbox_messages WHERE client_msg_id = $1',
+      [idemKey],
+    );
+    expect(Number(rows[0]?.count)).toBe(1);
+
+    // run 正常 finished
+    const run = await deps.agentRunRepo.getRun(pool, runId);
+    expect(run?.status).toBe('finished');
+  });
+
+  it('崩溃恢复：pending_execution + outbox 已存在 → 回填标记，不重发', async () => {
+    const { groupId } = await seedGroupWithMember('acct-1');
+    const runId = await createRunningRun(groupId);
+    const idemKey = '44444444-4444-4444-4444-444444444444';
+
+    const toolUseBlock: AgentContentBlock = { type: 'tool_use', id: 'tu-pending', name: 'send_message', input: { text: 'hi', idempotency_key: idemKey } };
+    {
+      const c = await pool.connect();
+      try {
+        await new AgentRunRepo(pool).appendMessage(c, runId, 'assistant', [toolUseBlock]);
+      } finally {
+        c.release();
+      }
+    }
+
+    // outbox 已入队但 tool_call 仍是 pending_execution（crash 在 mark 之前）
+    const { rows: outboxRows } = await pool.query<{ id: string }>(
+      `INSERT INTO outbox_messages (group_id, account_id, client_msg_id, text, delivery_status, origin)
+       SELECT $1, (SELECT id FROM accounts WHERE account_id='acct-1'), $2, 'hi', 'queued', 'agent'
+       RETURNING id`,
+      [groupId, idemKey],
+    );
+    await pool.query(
+      `INSERT INTO agent_tool_calls (run_id, idempotency_key, tool_use_id, state)
+       VALUES ($1, $2, 'tu-pending', 'pending_execution')`,
+      [runId, idemKey],
+    );
+
+    const script: AgentMessage[] = [
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'tu2', name: 'finish', input: { summary: 'done' } }] },
+    ];
+    const deps = makeDeps(new MockAgentClient(script));
+    await runAgent(deps, runId);
+
+    // 恢复后应标记为 executed
+    const tc = await deps.agentRunRepo.getToolCall(pool, runId, idemKey);
+    expect(tc?.state).toBe('executed');
+
+    const { rows } = await pool.query<{ count: string }>(
+      'SELECT COUNT(*)::text AS count FROM outbox_messages WHERE client_msg_id = $1',
+      [idemKey],
+    );
+    expect(Number(rows[0]?.count)).toBe(1);
+  });
+
+  // ---- F3：agentEnabled / unreachable → cancelled ----
+
+  it('agentEnabled 关闭 → run cancelled', async () => {
+    const { groupId } = await seedGroupWithMember('acct-1');
+    const runId = await createRunningRun(groupId);
+    // createRunningRun 会开启 agent_enabled，这里关闭
+    await pool.query(`UPDATE groups SET agent_enabled = false WHERE id = $1`, [groupId]);
+
+    const script: AgentMessage[] = [
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'get_recent_messages', input: { limit: 10 } }] },
+    ];
+    const deps = makeDeps(new MockAgentClient(script));
+    await runAgent(deps, runId);
+
+    const run = await deps.agentRunRepo.getRun(pool, runId);
+    expect(run?.status).toBe('cancelled');
+    expect(run?.endReason).toBe('cancelled');
+  });
+
+  it('群 unreachable → run cancelled', async () => {
+    const { groupId } = await seedGroupWithMember('acct-1');
+    await pool.query(`UPDATE groups SET status = 'unreachable' WHERE id = $1`, [groupId]);
+    const runId = await createRunningRun(groupId);
+
+    const script: AgentMessage[] = [
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'get_recent_messages', input: { limit: 10 } }] },
+    ];
+    const deps = makeDeps(new MockAgentClient(script));
+    await runAgent(deps, runId);
+
+    const run = await deps.agentRunRepo.getRun(pool, runId);
+    expect(run?.status).toBe('cancelled');
+  });
+
+  // ---- F3：重复 get_recent_messages ----
+
+  it('连续第 2 次相同入参 get_recent_messages → INVALID_INPUT', async () => {
+    const { groupId } = await seedGroupWithMember('acct-1');
+    const runId = await createRunningRun(groupId);
+
+    // 两次相同入参的 get_recent_messages，然后 finish
+    const script: AgentMessage[] = [
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'get_recent_messages', input: { limit: 10 } }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'tu2', name: 'get_recent_messages', input: { limit: 10 } }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'tu3', name: 'finish', input: { summary: 'done' } }] },
+    ];
+    const deps = makeDeps(new MockAgentClient(script));
+    await runAgent(deps, runId);
+
+    const steps = await deps.agentRunRepo.listSteps(pool, runId);
+    // 第 1 次正常（无 errorCode），第 2 次 INVALID_INPUT
+    expect(steps[0]?.isError).toBe(false);
+    expect(steps[1]?.errorCode).toBe('INVALID_INPUT');
   });
 });
