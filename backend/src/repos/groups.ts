@@ -208,6 +208,79 @@ export class GroupRepo {
   }
 
   // -------------------------------------------------------------------------
+  // 批次 3：群查询与设置（4.8-4.9）
+  // -------------------------------------------------------------------------
+
+  /** 按 UUID 查群（群详情页用）。 */
+  async findById(groupId: string): Promise<GroupRow | undefined> {
+    const { rows } = await this.pool.query<DbGroupRow>(
+      'SELECT * FROM groups WHERE id = $1',
+      [groupId],
+    );
+    return rows[0] !== undefined ? fromDbGroup(rows[0]) : undefined;
+  }
+
+  /** 列出全部群（群列表页用）。按创建时间倒序，新建的群排在前面。 */
+  async listAll(): Promise<GroupRow[]> {
+    const { rows } = await this.pool.query<DbGroupRow>(
+      'SELECT * FROM groups ORDER BY created_at DESC, id DESC',
+    );
+    return rows.map(fromDbGroup);
+  }
+
+  /** 列出群的全部成员（群详情页 members 字段）。 */
+  async listMembers(groupId: string): Promise<GroupMemberRow[]> {
+    const { rows } = await this.pool.query<DbGroupMemberRow>(
+      'SELECT * FROM group_members WHERE group_id = $1 ORDER BY joined_at ASC, account_id ASC',
+      [groupId],
+    );
+    return rows.map(fromDbMember);
+  }
+
+  /**
+   * 更新群设置（agentEnabled / autoKickEnabled），CAS version 防止并发覆盖。
+   * 不传的字段保持原值（COALESCE）；返回更新后的行，冲突返回 null。
+   */
+  async updateSettings(
+    groupId: string,
+    expectedVersion: number,
+    updates: { agentEnabled?: boolean; autoKickEnabled?: boolean },
+  ): Promise<GroupRow | null> {
+    const { rows, rowCount } = await this.pool.query<DbGroupRow>(
+      `UPDATE groups
+       SET agent_enabled      = COALESCE($2, agent_enabled),
+           auto_kick_enabled  = COALESCE($3, auto_kick_enabled),
+           version            = version + 1,
+           updated_at         = now()
+       WHERE id = $1 AND version = $4
+       RETURNING *`,
+      [
+        groupId,
+        updates.agentEnabled ?? null,
+        updates.autoKickEnabled ?? null,
+        expectedVersion,
+      ],
+    );
+    if (rowCount === 0 || rows[0] === undefined) return null;
+    return fromDbGroup(rows[0]);
+  }
+
+  /**
+   * 查该群当前 running 的序列 run id（群详情 activeRunId 字段）。
+   * 同一群至多一个 running（partial unique index 保证），故 LIMIT 1。
+   * 切片 5 才会真正写入 sequence_runs；当前恒返回 null。
+   */
+  async findActiveRunId(groupId: string): Promise<string | null> {
+    const { rows } = await this.pool.query<{ id: string }>(
+      `SELECT id FROM sequence_runs
+       WHERE group_id = $1 AND status = 'running'
+       LIMIT 1`,
+      [groupId],
+    );
+    return rows[0]?.id ?? null;
+  }
+
+  // -------------------------------------------------------------------------
   // 批次 2：建群 job 专用（4.3-4.6）
   // -------------------------------------------------------------------------
 

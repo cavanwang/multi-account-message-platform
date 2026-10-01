@@ -34,6 +34,7 @@ import { AccountRepo } from '../../repos/accounts.js';
 import { GroupRepo } from '../../repos/groups.js';
 import { JobRepo } from '../../repos/jobs.js';
 import { OutboxRepo } from '../../repos/outbox.js';
+import type { GroupRow, GroupMemberRow } from '../../repos/groups.js';
 
 interface RouteDeps {
   config: AppConfig;
@@ -52,6 +53,11 @@ interface CreateGroupBody {
 interface SendBody {
   accountId?: string;
   text?: string;
+}
+
+interface PatchGroupBody {
+  agentEnabled?: unknown;
+  autoKickEnabled?: unknown;
 }
 
 /**
@@ -288,4 +294,105 @@ export async function registerGroupRoutes(
       return { clientMsgId };
     },
   );
+
+  // GET /api/groups - 群列表
+  app.get('/api/groups', async () => {
+    const groups = await groupRepo.listAll();
+    return groups.map(toGroupSummary);
+  });
+
+  // GET /api/groups/:id - 群详情（含成员列表 + activeRunId）
+  app.get<{ Params: GroupParams }>(
+    '/api/groups/:id',
+    async (request: FastifyRequest<{ Params: GroupParams }>) => {
+      const { id: groupId } = request.params;
+      if (!UUID_RE.test(groupId)) {
+        throw AppError.badRequest(`路径参数 id 必须是 UUID，当前为 "${groupId}"`);
+      }
+
+      const group = await groupRepo.findById(groupId);
+      if (group === undefined) {
+        throw AppError.notFound(`群 ${groupId} 不存在`);
+      }
+
+      const [members, activeRunId] = await Promise.all([
+        groupRepo.listMembers(groupId),
+        groupRepo.findActiveRunId(groupId),
+      ]);
+
+      return {
+        ...toGroupSummary(group),
+        members: members.map(toMemberDto),
+        activeRunId,
+      };
+    },
+  );
+
+  // PATCH /api/groups/:id - 更新群设置（agentEnabled / autoKickEnabled）
+  app.patch<{ Params: GroupParams; Body: PatchGroupBody }>(
+    '/api/groups/:id',
+    async (request: FastifyRequest<{ Params: GroupParams; Body: PatchGroupBody }>) => {
+      const { id: groupId } = request.params;
+      if (!UUID_RE.test(groupId)) {
+        throw AppError.badRequest(`路径参数 id 必须是 UUID，当前为 "${groupId}"`);
+      }
+
+      const body = request.body ?? {};
+      const hasAgent = body.agentEnabled !== undefined;
+      const hasAutoKick = body.autoKickEnabled !== undefined;
+      if (!hasAgent && !hasAutoKick) {
+        throw AppError.badRequest('至少需要提供 agentEnabled 或 autoKickEnabled 之一');
+      }
+      if (hasAgent && typeof body.agentEnabled !== 'boolean') {
+        throw AppError.badRequest('agentEnabled 必须是布尔值');
+      }
+      if (hasAutoKick && typeof body.autoKickEnabled !== 'boolean') {
+        throw AppError.badRequest('autoKickEnabled 必须是布尔值');
+      }
+
+      const group = await groupRepo.findById(groupId);
+      if (group === undefined) {
+        throw AppError.notFound(`群 ${groupId} 不存在`);
+      }
+
+      const updates: { agentEnabled?: boolean; autoKickEnabled?: boolean } = {};
+      if (hasAgent) updates.agentEnabled = body.agentEnabled as boolean;
+      if (hasAutoKick) updates.autoKickEnabled = body.autoKickEnabled as boolean;
+
+      const updated = await groupRepo.updateSettings(groupId, group.version, updates);
+      if (updated === null) {
+        // version CAS 失败：并发修改导致版本号不匹配
+        throw AppError.conflict(
+          ErrorCode.CAS_CONFLICT,
+          '群设置已被其他请求修改，请重试',
+        );
+      }
+
+      return toGroupSummary(updated);
+    },
+  );
+}
+
+/** 群列表/摘要响应（不含 members）。 */
+function toGroupSummary(g: GroupRow): Record<string, unknown> {
+  return {
+    id: g.id,
+    gatewayGroupId: g.gatewayGroupId,
+    status: g.status,
+    creatorAccountId: g.creatorAccountId,
+    agentEnabled: g.agentEnabled,
+    autoKickEnabled: g.autoKickEnabled,
+    createdAt: g.createdAt.toISOString(),
+    updatedAt: g.updatedAt.toISOString(),
+  };
+}
+
+/** 成员响应。 */
+function toMemberDto(m: GroupMemberRow): Record<string, unknown> {
+  return {
+    accountId: m.accountId,
+    platformUserId: m.platformUserId,
+    role: m.role,
+    joinedAt: m.joinedAt.toISOString(),
+  };
 }
