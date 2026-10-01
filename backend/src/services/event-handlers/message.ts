@@ -5,7 +5,8 @@
  *  - senderPlatformUserId 命中 group_members → isOwn = true（服务账号自己发的消息）；
  *  - upsert messages(group_id, msg_id)（PK 唯一，一行原则）；
  *  - isOwn = false 且 group.agentEnabled = true → 触发 agent run（创建 run 行，由 worker 执行）；
- *  - 事务内入队 web_event 'message_received'（INV-5）。
+ *  - 事务内入队 web_event 'message'（§2.3 前端事件名，INV-5）；
+ *  - 新建 run 时在同一事务入队 'agent_run'（status=running）。
  */
 import { GroupRepo } from '../../repos/groups.js';
 import { AgentRunRepo } from '../../repos/agent-runs.js';
@@ -48,6 +49,7 @@ export async function handleMessage(ctx: HandlerContext, payload: unknown): Prom
   });
 
   // 非自己消息 + agentEnabled → 触发 agent run
+  let newAgentRunId: string | null = null;
   if (!isOwn && group.agentEnabled) {
     const agentRunRepo = new AgentRunRepo(ctx.pool);
     const run = await agentRunRepo.createRun(ctx.client, group.id);
@@ -59,11 +61,14 @@ export async function handleMessage(ctx: HandlerContext, payload: unknown): Prom
       if (runningRun !== undefined) {
         await agentRunRepo.addPendingMessage(ctx.client, runningRun.id, msgId);
       }
+    } else {
+      // run !== null → 新 run 已创建，由 agent-runner-worker 轮询执行
+      newAgentRunId = run.id;
     }
-    // run !== null → 新 run 已创建，由 agent-runner-worker 轮询执行
   }
 
-  await enqueueWebEvent(ctx.client, 'message_received', {
+  // 前端时间线实时追加事件（§2.3：message { groupId, msgId, isOwn }）
+  await enqueueWebEvent(ctx.client, 'message', {
     groupId: group.id,
     msgId,
     senderPlatformUserId,
@@ -72,6 +77,16 @@ export async function handleMessage(ctx: HandlerContext, payload: unknown): Prom
     sentAt: sentAt.toISOString(),
     mediaUrl: mediaUrl ?? null,
   });
+
+  // 新建 agent run → 同事务通知前端（run 行已落库，满足"事件对应已保存状态"）
+  if (newAgentRunId !== null) {
+    await enqueueWebEvent(ctx.client, 'agent_run', {
+      runId: newAgentRunId,
+      groupId: group.id,
+      status: 'running',
+      endReason: null,
+    });
+  }
 
   ctx.log.info(
     { groupId: group.id, msgId, isOwn },

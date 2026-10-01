@@ -103,6 +103,7 @@ export async function handleMessageSent(ctx: HandlerContext, payload: unknown): 
             sequenceRepo,
             ctx.client,
             step.runId,
+            outbox.groupId,
             sequence.steps,
             step.stepIndex,
             sentAt,

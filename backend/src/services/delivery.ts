@@ -239,13 +239,15 @@ export class DeliveryService {
       // 1) 群 → unreachable（幂等：已是 unreachable 时不动）
       await this.groupRepo.markUnreachable(client, row.groupId);
 
-      // 2) 停该群所有 running 序列
-      const { rowCount: stoppedRuns } = await client.query(
+      // 2) 停该群所有 running 序列（RETURNING 带出 runId/进度，供逐个发 sequence_run 事件）
+      const stoppedRows = await client.query<{ id: string; current_step_index: number }>(
         `UPDATE sequence_runs
          SET status = 'stopped', version = version + 1, updated_at = now()
-         WHERE group_id = $1 AND status = 'running'`,
+         WHERE group_id = $1 AND status = 'running'
+         RETURNING id, current_step_index`,
         [row.groupId],
       );
+      const stoppedRuns = stoppedRows.rowCount;
 
       // 3) 该行 → failed
       const { rowCount: failedRow } = await client.query(
@@ -258,11 +260,13 @@ export class DeliveryService {
         [row.id],
       );
 
-      // 4) web_events
-      if ((stoppedRuns ?? 0) > 0) {
-        await enqueueWebEvent(client, 'sequence_stopped', {
+      // 4) web_events：每个被停的 run 发一条 §2.3 sequence_run（status=stopped）
+      for (const r of stoppedRows.rows) {
+        await enqueueWebEvent(client, 'sequence_run', {
+          runId: r.id,
           groupId: row.groupId,
-          reason: 'GROUP_WRITE_FORBIDDEN',
+          status: 'stopped',
+          currentStepIndex: r.current_step_index,
         });
       }
       if ((failedRow ?? 0) > 0) {

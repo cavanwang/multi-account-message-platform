@@ -15,6 +15,7 @@ import type { GroupRepo, GroupMemberRow } from '../repos/groups.js';
 import type { AccountRepo } from '../repos/accounts.js';
 import type { OutboxRepo } from '../repos/outbox.js';
 import type { LoggerLike } from './gateway-client.js';
+import { enqueueWebEvent } from '../repos/web-events.js';
 
 /** 占位符正则：{key}，key 匹配 [A-Za-z0-9_]+。 */
 const PLACEHOLDER_RE = /\{([A-Za-z0-9_]+)\}/g;
@@ -232,6 +233,14 @@ export async function startSequenceRun(
       }));
       await deps.sequenceRepo.insertSteps(client, run.id, stepInserts);
 
+      // §2.3：run 已落库 → 同事务通知前端（页面 5 立即显示进度）
+      await enqueueWebEvent(client, 'sequence_run', {
+        runId: run.id,
+        groupId,
+        status: 'running',
+        currentStepIndex: 0,
+      });
+
       await client.query('COMMIT');
       deps.log.info({ runId: run.id, groupId, steps: sequence.steps.length }, 'sequence: run started');
       return run.id;
@@ -291,7 +300,7 @@ export async function executeDueStep(
       if (sel.kind === 'none') {
         // skipped
         await deps.sequenceRepo.markStepSkipped(client, runId, stepIndex);
-        await scheduleNextStep(deps.sequenceRepo, client, runId, sequence.steps, stepIndex, new Date());
+        await scheduleNextStep(deps.sequenceRepo, client, runId, run.groupId, sequence.steps, stepIndex, new Date());
         await client.query('COMMIT');
         deps.log.info({ runId, stepIndex }, 'sequence: step skipped（无可用账号）');
         return;
@@ -322,11 +331,15 @@ export async function executeDueStep(
  * 排下一步：第 n 步在第 n-1 步"发出"后 delaySeconds 秒发送。
  * skipped 步骤视为在跳过时刻"发出"。
  * 若已是最后一步 → finish run。
+ *
+ * 每次推进/结束都在同一事务连接上发 §2.3 'sequence_run' 事件，
+ * 保证页面 5 的进度条随 currentStepIndex 实时移动。
  */
 export async function scheduleNextStep(
   sequenceRepo: SequenceRepo,
   client: PoolClient,
   runId: string,
+  groupId: string,
   steps: SequenceStepDef[],
   currentStepIndex: number,
   sentAt: Date,
@@ -334,10 +347,22 @@ export async function scheduleNextStep(
   const nextIndex = currentStepIndex + 1;
   if (nextIndex >= steps.length) {
     await sequenceRepo.finishRun(client, runId, 'finished');
+    await enqueueWebEvent(client, 'sequence_run', {
+      runId,
+      groupId,
+      status: 'finished',
+      currentStepIndex,
+    });
     return;
   }
   const nextDelay = steps[nextIndex]!.delaySeconds * 1000;
   const scheduledAt = new Date(sentAt.getTime() + nextDelay);
   await sequenceRepo.scheduleStep(client, runId, nextIndex, scheduledAt);
   await sequenceRepo.advanceCurrentStep(client, runId, nextIndex);
+  await enqueueWebEvent(client, 'sequence_run', {
+    runId,
+    groupId,
+    status: 'running',
+    currentStepIndex: nextIndex,
+  });
 }

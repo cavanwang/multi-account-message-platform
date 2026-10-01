@@ -82,6 +82,8 @@ interface DbSequenceStep {
   resolved_vars: unknown;
   var_sources: unknown;
   updated_at: Date;
+  /** getSteps 的 LEFT JOIN 带出；其他查询不选此列时为 undefined。 */
+  outbox_client_msg_id?: string | null;
 }
 
 function fromDbSequence(r: DbSequence): SequenceRow {
@@ -108,15 +110,15 @@ function fromDbRun(r: DbSequenceRun): SequenceRunRow {
 }
 
 function fromDbStep(r: DbSequenceStep): SequenceStepRow {
-  // client_msg_id 列在 0009 迁移中添加；这里从 outbox 关联取，避免加列查询复杂度。
-  // 实际 clientMsgId 通过 outbox_id 关联 outbox_messages.client_msg_id 获取。
+  // clientMsgId 不落在 sequence_steps 表上：getSteps 通过 LEFT JOIN outbox_messages 带出，
+  // 未关联 outbox（pending/skipped）或非 JOIN 查询时为 null。
   return {
     id: r.id,
     runId: r.run_id,
     stepIndex: r.step_index,
     status: r.status,
     outboxId: r.outbox_id,
-    clientMsgId: null,
+    clientMsgId: r.outbox_client_msg_id ?? null,
     scheduledAt: r.scheduled_at,
     sentAt: r.sent_at,
     resolvedVars: (r.resolved_vars as Record<string, string>) ?? null,
@@ -228,7 +230,11 @@ export class SequenceRepo {
 
   async getSteps(queryable: Queryable, runId: string): Promise<SequenceStepRow[]> {
     const { rows } = await queryable.query<DbSequenceStep>(
-      'SELECT * FROM sequence_steps WHERE run_id = $1 ORDER BY step_index ASC',
+      `SELECT ss.*, om.client_msg_id AS outbox_client_msg_id
+       FROM sequence_steps ss
+       LEFT JOIN outbox_messages om ON om.id = ss.outbox_id
+       WHERE ss.run_id = $1
+       ORDER BY ss.step_index ASC`,
       [runId],
     );
     return rows.map(fromDbStep);

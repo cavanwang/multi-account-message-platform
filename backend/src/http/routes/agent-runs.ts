@@ -33,10 +33,14 @@ export async function registerAgentRunRoutes(app: FastifyInstance, pool: Pool): 
           kind: s.kind,
           name: s.name,
           toolUseId: s.toolUseId,
+          // 页面 4（B4）：入参与原始响应体必须可见；
+          // 协议错误步的 input 为 null（契约），rawResponse 截断到 2KB（agent-runner 已处理）
+          input: s.input,
           isError: s.isError,
           errorCode: s.errorCode,
           auditVerdict: s.auditVerdict,
           resultSummary: s.resultSummary,
+          rawResponse: s.rawResponse,
           createdAt: s.createdAt.toISOString(),
         })),
       };

@@ -11,6 +11,7 @@ import type { Pool, PoolClient } from 'pg';
 import { SequenceRepo } from '../repos/sequences.js';
 import { executeDueStep, scheduleNextStep, type SequenceRunnerDeps } from '../services/sequence-runner.js';
 import type { LoggerLike } from '../services/gateway-client.js';
+import { enqueueWebEvent } from '../repos/web-events.js';
 
 export class SequenceRunnerWorker {
   private running = false;
@@ -94,12 +95,26 @@ export class SequenceRunnerWorker {
           // sentAt 从 outbox 获取
           const sentAt = new Date();
           await this.deps.sequenceRepo.markStepSent(client, step.runId, step.stepIndex, sentAt);
-          await scheduleNextStep(this.deps.sequenceRepo, client, step.runId, sequence.steps, step.stepIndex, sentAt);
+          await scheduleNextStep(
+            this.deps.sequenceRepo,
+            client,
+            step.runId,
+            run.groupId,
+            sequence.steps,
+            step.stepIndex,
+            sentAt,
+          );
           this.deps.log.info({ runId: step.runId, stepIndex: step.stepIndex }, 'sequence: step sent');
         } else if (step.deliveryStatus === 'failed' || step.deliveryStatus === 'cancelled') {
-          // 投递失败 → run failed
+          // 投递失败 → run failed，同事务发 sequence_run 终态事件
           await this.deps.sequenceRepo.markStepFailed(client, step.runId, step.stepIndex);
           await this.deps.sequenceRepo.finishRun(client, step.runId, 'failed');
+          await enqueueWebEvent(client, 'sequence_run', {
+            runId: step.runId,
+            groupId: run.groupId,
+            status: 'failed',
+            currentStepIndex: step.stepIndex,
+          });
           this.deps.log.warn({ runId: step.runId, stepIndex: step.stepIndex }, 'sequence: step failed → run failed');
         }
         // queued / accepted / unknown → 继续等

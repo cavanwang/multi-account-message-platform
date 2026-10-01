@@ -146,12 +146,38 @@ button.btn.danger:hover:not(:disabled) {
   color: var(--color-danger);
 }
 
-input.input {
+input.input,
+select.input {
   border: 1px solid var(--color-border);
   border-radius: 6px;
   padding: 8px 10px;
   font-size: 14px;
   width: 100%;
+}
+
+/* <Link> 复用按钮外观（按钮样式默认只匹配 button 元素） */
+a.btn {
+  display: inline-block;
+  border: 1px solid var(--color-border);
+  background: #fff;
+  border-radius: 6px;
+  padding: 5px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  margin-right: 6px;
+  text-decoration: none;
+  color: var(--color-text);
+}
+
+a.btn:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+a.btn.primary {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: #fff;
 }
 
 /* ---- 状态徽标 ---- */
@@ -201,9 +227,64 @@ input.input {
 
 .badge.failed,
 .badge.blocked,
-.badge.cancelled {
+.badge.cancelled,
+.badge.stopped {
   background: #fee2e2;
   color: #b91c1c;
+}
+
+/* 序列步骤级状态 */
+.badge.step-pending {
+  background: #e2e8f0;
+  color: #475569;
+}
+
+.badge.step-accepted,
+.badge.step-sent {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.badge.step-skipped {
+  background: #f1f5f9;
+  color: #64748b;
+}
+
+.badge.step-failed {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+/* agent 步骤 kind / 审计 / 错误码徽标 */
+.badge.kind-tool_use {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.badge.kind-final {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.badge.kind-protocol_error,
+.badge.error-code {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.badge.audit-pass {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.badge.audit-reject {
+  background: #ffedd5;
+  color: #c2410c;
+}
+
+/* 运行中当前步骤行高亮 */
+tr.row-current {
+  background: #eff6ff;
 }
 
 /* blocked 的 agent run：整行醒目高亮 */
@@ -267,4 +348,166 @@ tr.row-blocked {
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
+}
+
+/* ---- 页面 4：Agent 运行步骤详情 ---- */
+.step-card {
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 10px;
+}
+
+.step-card.error {
+  border-color: var(--color-warn-border);
+  background: var(--color-warn-bg);
+}
+
+.step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.step-no {
+  font-weight: 700;
+  color: var(--color-text-dim);
+}
+
+.tool-name {
+  font-weight: 600;
+}
+
+.step-body {
+  margin: 0;
+  font-size: 13px;
+}
+
+.step-body dt {
+  color: var(--color-text-dim);
+  margin-top: 6px;
+}
+
+.step-body dd {
+  margin: 2px 0 0;
+}
+
+.json-pre {
+  background: #0f172a;
+  color: #e2e8f0;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 4px 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.raw-block {
+  margin-top: 8px;
+}
+
+.raw-pre {
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+/* ---- 页面 5：序列运行 / 预检弹窗 ---- */
+.form-label {
+  display: block;
+  font-size: 13px;
+  color: var(--color-text-dim);
+  margin: 12px 0 4px;
+}
+
+.form-section {
+  font-size: 14px;
+  margin: 18px 0 8px;
+}
+
+.kv-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 8px 16px;
+}
+
+.kv-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.kv-row > span {
+  flex-shrink: 0;
+  min-width: 72px;
+  color: var(--color-text-dim);
+}
+
+.step-override {
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--color-border);
+}
+
+/* 变量取值芯片：key=value + 来源 */
+.var-chip {
+  display: inline-block;
+  background: #f1f5f9;
+  border-radius: 6px;
+  padding: 2px 8px;
+  margin: 2px 6px 2px 0;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.var-chip .var-source {
+  margin-left: 6px;
+  font-style: normal;
+  color: var(--color-primary);
+}
+
+.vars-cell {
+  max-width: 360px;
+}
+
+.run-panel {
+  font-size: 14px;
+}
+
+/* 模态弹窗（预检结果） */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.55);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 16px;
+  overflow-y: auto;
+  z-index: 100;
+}
+
+.modal {
+  background: #fff;
+  border-radius: 10px;
+  padding: 20px 24px;
+  max-width: 880px;
+  width: 100%;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.25);
+}
+
+.modal h2 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.modal-actions {
+  margin-top: 16px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }

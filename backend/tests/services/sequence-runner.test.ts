@@ -233,4 +233,44 @@ describe('sequence-runner 启动与执行', () => {
     // 仍是 pending，等待限流结束
     expect(stepRows[0]!.status).toBe('pending');
   });
+
+  it('§2.3 事件：启动 → running/0；跳过中间步 → running/1；最后一步跳过 → finished', async () => {
+    const { groupId } = await seedGroupWithMember('acct-1');
+    // member 角色无 online 账号 → 每一步都会 skipped
+    await pool.query(`UPDATE accounts SET status='disconnected' WHERE account_id='acct-1'`);
+
+    const deps = makeDeps();
+    const steps: SequenceStepDef[] = [
+      { text: 'Step 1', delaySeconds: 0, accountRole: 'member' },
+      { text: 'Step 2', delaySeconds: 0, accountRole: 'member' },
+    ];
+    const seq = await deps.sequenceRepo.createSequence(pool, 'test', steps);
+    const runId = await startSequenceRun(deps, groupId, seq.id, {}, {});
+
+    // 启动事件
+    let events = await pool.query<{ payload: { status: string; currentStepIndex: number } }>(
+      `SELECT payload FROM web_events
+       WHERE type = 'sequence_run' AND payload->>'runId' = $1
+       ORDER BY seq ASC`,
+      [runId],
+    );
+    expect(events.rows).toHaveLength(1);
+    expect(events.rows[0]!.payload).toMatchObject({ status: 'running', currentStepIndex: 0 });
+
+    await executeDueStep(deps, runId, 0);
+    await executeDueStep(deps, runId, 1);
+
+    events = await pool.query<{ payload: { status: string; currentStepIndex: number } }>(
+      `SELECT payload FROM web_events
+       WHERE type = 'sequence_run' AND payload->>'runId' = $1
+       ORDER BY seq ASC`,
+      [runId],
+    );
+    // 启动 + 推进到第 2 步 + finished，共 3 条
+    expect(events.rows.map((r) => [r.payload.status, r.payload.currentStepIndex])).toEqual([
+      ['running', 0],
+      ['running', 1],
+      ['finished', 1],
+    ]);
+  });
 });

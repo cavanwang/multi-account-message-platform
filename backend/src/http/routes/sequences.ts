@@ -2,6 +2,8 @@
  * 定时序列路由（规划 05 §3）：
  *   - POST /api/sequences              创建序列模板 → 201 { id }
  *   - GET  /api/sequences              序列列表
+ *   - POST /api/sequences/precheck       预检（不创建运行）→ 200 每步解析预览
+ *                                         422 UNRESOLVED_PLACEHOLDER { stepIndex, key }
  *   - POST /api/groups/:id/sequence-runs  启动序列运行 → 201 { runId }
  *                                         409 SEQUENCE_ALREADY_RUNNING
  *                                         422 UNRESOLVED_PLACEHOLDER { stepIndex, key }
@@ -12,7 +14,12 @@ import type { FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
 import { AppError, ErrorCode } from '../errors.js';
 import { SequenceRepo, type SequenceStepDef } from '../../repos/sequences.js';
-import { startSequenceRun } from '../../services/sequence-runner.js';
+import {
+  computeStickyVars,
+  preflight,
+  resolveText,
+  startSequenceRun,
+} from '../../services/sequence-runner.js';
 import { GroupRepo } from '../../repos/groups.js';
 import { AccountRepo } from '../../repos/accounts.js';
 import { OutboxRepo } from '../../repos/outbox.js';
@@ -57,6 +64,54 @@ export async function registerSequenceRoutes(app: FastifyInstance, deps: RouteDe
       try {
         const seq = await sequenceRepo.createSequence(client, name, steps);
         return reply.code(201).send({ id: seq.id, name: seq.name, steps: seq.steps });
+      } finally {
+        client.release();
+      }
+    },
+  );
+
+  // POST /api/sequences/precheck — 预检（B4 页面 5 的预检弹窗）
+  // 只读计算，不创建任何运行记录：返回每步占位符的最终取值/来源与解析后文本；
+  // 任一占位符无法解析 → 422 UNRESOLVED_PLACEHOLDER（与启动端点同形，前端可复用错误展示）。
+  app.post<{ Body: { sequenceId?: unknown; vars?: unknown; stepVars?: unknown } }>(
+    '/api/sequences/precheck',
+    async (req) => {
+      const sequenceId = typeof req.body?.sequenceId === 'string' ? req.body.sequenceId : '';
+      if (sequenceId === '') {
+        throw new AppError(400, ErrorCode.VALIDATION_ERROR, 'sequenceId 不能为空');
+      }
+      const vars = (req.body?.vars ?? {}) as Record<string, string>;
+      const stepVars = (req.body?.stepVars ?? {}) as Record<string, Record<string, string>>;
+
+      const client = await deps.pool.connect();
+      try {
+        const sequence = await sequenceRepo.getSequence(client, sequenceId);
+        if (sequence === undefined) {
+          throw new AppError(404, ErrorCode.NOT_FOUND, '序列不存在');
+        }
+
+        const unresolved = preflight(sequence.steps, vars, stepVars);
+        if (unresolved !== null) {
+          throw new AppError(422, ErrorCode.UNRESOLVED_PLACEHOLDER, '占位符无法解析', {
+            stepIndex: unresolved.stepIndex,
+            key: unresolved.key,
+          });
+        }
+
+        const sticky = computeStickyVars(sequence.steps, vars, stepVars);
+        return {
+          sequenceId: sequence.id,
+          name: sequence.name,
+          steps: sequence.steps.map((s, i) => ({
+            stepIndex: i,
+            accountRole: s.accountRole,
+            delaySeconds: s.delaySeconds,
+            text: s.text,
+            resolvedText: resolveText(s.text, sticky[i]!.resolvedVars),
+            resolvedVars: sticky[i]!.resolvedVars,
+            varSources: sticky[i]!.varSources,
+          })),
+        };
       } finally {
         client.release();
       }
@@ -128,8 +183,9 @@ export async function registerSequenceRoutes(app: FastifyInstance, deps: RouteDe
         stepIndex: s.stepIndex,
         status: s.status,
         outboxId: s.outboxId,
-        scheduledAt: s.scheduledAt,
-        sentAt: s.sentAt,
+        clientMsgId: s.clientMsgId,
+        scheduledAt: s.scheduledAt !== null ? s.scheduledAt.toISOString() : null,
+        sentAt: s.sentAt !== null ? s.sentAt.toISOString() : null,
         resolvedVars: s.resolvedVars,
         varSources: s.varSources,
       })),

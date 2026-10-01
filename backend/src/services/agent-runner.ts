@@ -16,7 +16,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
-import type { AgentRunRepo } from '../repos/agent-runs.js';
+import type { AgentEndReason, AgentRunRepo, AgentRunStatus } from '../repos/agent-runs.js';
 import type { GroupRepo } from '../repos/groups.js';
 import type { OutboxRepo } from '../repos/outbox.js';
 import { listTimeline } from '../repos/messages.js';
@@ -126,32 +126,50 @@ export async function runAgent(deps: AgentRunnerDeps, runId: string): Promise<vo
     while (run.status === 'running') {
       stepNo++;
 
+      /**
+       * run 终态统一出口：落库终态并发 §2.3 'agent_run' 前端事件
+       * （{ runId, groupId, status, endReason }）。所有结束路径必须经此函数，
+       * 避免漏发事件导致页面状态不刷新。
+       */
+      const finishRunWithEvent = async (
+        status: AgentRunStatus,
+        endReason: AgentEndReason,
+        summary: string | null,
+      ): Promise<void> => {
+        await agentRunRepo.finishRun(client, runId, status, endReason, summary);
+        await enqueueWebEvent(client, 'agent_run', {
+          runId,
+          groupId: run.groupId,
+          status,
+          endReason,
+        });
+      };
+
       // ---- 外部状态检查：群 unreachable 或 agentEnabled 关闭 → cancelled ----
       const groupCheck = await deps.groupRepo.findById(run.groupId);
       if (groupCheck === undefined || groupCheck.status === 'unreachable' || !groupCheck.agentEnabled) {
         const reason = groupCheck?.status === 'unreachable' ? 'group_unreachable' : 'agent_disabled';
-        await agentRunRepo.finishRun(client, runId, 'cancelled', 'cancelled', null);
-        await enqueueWebEvent(client, 'agent_cancelled', { runId, groupId: run.groupId, reason });
+        await finishRunWithEvent('cancelled', 'cancelled', null);
         log.info({ runId, reason }, 'agent: 群不可达或 agent 已关闭，run cancelled');
         return;
       }
 
       // ---- 预算检查 ----
       if (stepNo > MAX_STEPS) {
-        await agentRunRepo.finishRun(client, runId, 'failed', 'budget_exhausted', null);
+        await finishRunWithEvent('failed', 'budget_exhausted', null);
         log.info({ runId }, 'agent: 超出 12 步预算，failed');
         return;
       }
 
       const elapsed = Date.now() - runStart + run.accumulatedMs;
       if (elapsed > MAX_WALL_CLOCK_MS) {
-        await agentRunRepo.finishRun(client, runId, 'failed', 'wall_clock', null);
+        await finishRunWithEvent('failed', 'wall_clock', null);
         log.info({ runId, elapsed }, 'agent: 超出 60s 墙钟，failed');
         return;
       }
 
       if (consecutiveProtocolErrors >= MAX_CONSECUTIVE_PROTOCOL_ERRORS) {
-        await agentRunRepo.finishRun(client, runId, 'failed', 'protocol_errors', null);
+        await finishRunWithEvent('failed', 'protocol_errors', null);
         log.info({ runId }, 'agent: 连续 3 次协议错误，failed');
         return;
       }
@@ -205,7 +223,7 @@ export async function runAgent(deps: AgentRunnerDeps, runId: string): Promise<vo
           auditVerdict: null,
           rawResponse: null,
         });
-        await agentRunRepo.finishRun(client, runId, 'finished', 'final', summary);
+        await finishRunWithEvent('finished', 'final', summary);
         log.info({ runId }, 'agent: run finished');
         return;
       }
@@ -250,9 +268,8 @@ export async function runAgent(deps: AgentRunnerDeps, runId: string): Promise<vo
           }
         } catch (err) {
           if (err instanceof AuditBlockedError) {
-            // run → blocked，推事件通知操作员
-            await agentRunRepo.finishRun(client, runId, 'blocked', 'audit_blocked', null);
-            await enqueueWebEvent(client, 'agent_blocked', { runId, groupId: run.groupId, reason: 'audit_blocked' });
+            // run → blocked，发 agent_run 事件通知操作员（页面 3 醒目提示、页面 4 可见）
+            await finishRunWithEvent('blocked', 'audit_blocked', null);
             log.info({ runId }, 'agent: 审计连续失败，run blocked');
             return;
           }

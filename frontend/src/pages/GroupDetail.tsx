@@ -1,15 +1,18 @@
 /**
  * 群详情页（页面 3）。
  *
- * 三个区块：
+ * 四个区块：
  *   1. 群信息 + 成员列表（含 role）
  *   2. 消息时间线：升序展示（新消息在底部）；"加载更早"游标分页；
  *      WS 实时追加；自己的消息显示 deliveryStatus
- *   3. 该群最近的 agent run 列表（status、endReason），blocked 行醒目提示
+ *   3. 该群最近的 agent run 列表（status、endReason），blocked 行醒目提示；
+ *      Run ID 可点击进入页面 4（步骤详情）
+ *   4. 该群最近的序列运行，入口链接到页面 5（预检/启动/进度）
  *
  * 实时性：WS 事件驱动。
  *   - message（本群）        → 重拉最新一页消息并合并（去重）
  *   - agent_run（本群）      → 重拉 run 列表
+ *   - sequence_run（本群）   → 重拉序列运行列表
  *   - 断线重连由 useWebSocket 内部用 sinceSeq 补发，不丢事件
  */
 import { useCallback, useEffect, useState } from 'react';
@@ -19,6 +22,7 @@ import { useWebSocket } from '../api/useWebSocket';
 import type {
   AgentRunListItemDto,
   GroupDetailDto,
+  SequenceRunListItemDto,
   TimelineItemDto,
   TimelinePageDto,
 } from '../api/types';
@@ -53,6 +57,13 @@ const RUN_STATUS_LABEL: Record<string, string> = {
   cancelled: '已取消',
 };
 
+const SEQUENCE_STATUS_LABEL: Record<string, string> = {
+  running: '运行中',
+  finished: '已完成',
+  failed: '失败',
+  stopped: '已停止',
+};
+
 const GROUP_STATUS_LABEL: Record<string, string> = {
   active: '正常',
   unreachable: '不可达',
@@ -74,6 +85,7 @@ export default function GroupDetailPage({ session }: Props) {
   const [messages, setMessages] = useState<TimelineItemDto[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [runs, setRuns] = useState<AgentRunListItemDto[]>([]);
+  const [seqRuns, setSeqRuns] = useState<SequenceRunListItemDto[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const isAdmin = session.role === 'admin';
@@ -145,13 +157,25 @@ export default function GroupDetailPage({ session }: Props) {
     }
   }, [groupId]);
 
+  // 序列运行列表失败不阻塞页面（页面 5 有独立入口）
+  const loadSeqRuns = useCallback(async (): Promise<void> => {
+    try {
+      setSeqRuns(
+        await api<SequenceRunListItemDto[]>(`/api/groups/${groupId}/sequence-runs`),
+      );
+    } catch {
+      // 忽略：仅在区块内不可见，不影响群详情主体
+    }
+  }, [groupId]);
+
   useEffect(() => {
     setMessages([]);
     setNextCursor(null);
     void loadGroup();
     void refreshLatest();
     void loadRuns();
-  }, [loadGroup, refreshLatest, loadRuns]);
+    void loadSeqRuns();
+  }, [loadGroup, refreshLatest, loadRuns, loadSeqRuns]);
 
   // ---- WS 实时刷新 ----
   const onWsEvent = useCallback(
@@ -162,8 +186,11 @@ export default function GroupDetailPage({ session }: Props) {
       if (frame.type === 'agent_run' && frame.payload['groupId'] === groupId) {
         void loadRuns();
       }
+      if (frame.type === 'sequence_run' && frame.payload['groupId'] === groupId) {
+        void loadSeqRuns();
+      }
     },
-    [groupId, refreshLatest, loadRuns],
+    [groupId, refreshLatest, loadRuns, loadSeqRuns],
   );
   useWebSocket({ onEvent: onWsEvent, enabled: true });
 
@@ -269,7 +296,10 @@ export default function GroupDetailPage({ session }: Props) {
           <tbody>
             {runs.map((r) => (
               <tr key={r.id} className={r.status === 'blocked' ? 'row-blocked' : undefined}>
-                <td className="mono">{r.id.slice(0, 8)}…</td>
+                <td className="mono">
+                  {/* 页面 4：步骤详情（kind/工具/入参/结果/审计/错误码/原始响应体） */}
+                  <Link to={`/agent-runs/${r.id}`}>{r.id.slice(0, 8)}…</Link>
+                </td>
                 <td>
                   <span className={`badge ${r.status}`}>
                     {RUN_STATUS_LABEL[r.status] ?? r.status}
@@ -290,6 +320,47 @@ export default function GroupDetailPage({ session }: Props) {
           </tbody>
         </table>
         {!isAdmin && <p className="hint">只读模式：写操作按钮已隐藏。</p>}
+      </div>
+
+      {/* ---- 序列运行（页面 5 入口） ---- */}
+      <div className="card">
+        <h2>序列运行</h2>
+        <p>
+          <Link className="btn primary" to={`/groups/${group.id}/sequences`}>
+            打开序列运行页（选择序列 / 预检 / 启动 / 查看进度）
+          </Link>
+        </p>
+        <table className="data">
+          <thead>
+            <tr>
+              <th>Run ID</th>
+              <th>状态</th>
+              <th>当前步骤</th>
+              <th>开始时间</th>
+            </tr>
+          </thead>
+          <tbody>
+            {seqRuns.map((r) => (
+              <tr key={r.id}>
+                <td className="mono">{r.id.slice(0, 8)}…</td>
+                <td>
+                  <span className={`badge ${r.status}`}>
+                    {SEQUENCE_STATUS_LABEL[r.status] ?? r.status}
+                  </span>
+                </td>
+                <td>{r.status === 'running' ? `第 ${r.currentStepIndex + 1} 步` : '—'}</td>
+                <td className="mono">{formatTime(r.createdAt)}</td>
+              </tr>
+            ))}
+            {seqRuns.length === 0 && (
+              <tr>
+                <td colSpan={4} className="hint">
+                  暂无序列运行记录
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
         <p className="hint">
           <Link to="/groups">← 返回群列表</Link>
         </p>

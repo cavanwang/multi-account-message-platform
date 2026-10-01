@@ -104,6 +104,27 @@ describe('AgentRunner F1', () => {
     expect(steps.map((s) => s.name)).toEqual(['get_recent_messages', 'send_message', 'finish']);
   });
 
+  it('run 结束时发且只发一条 agent_run 终态事件（§2.3）', async () => {
+    const { groupId } = await seedGroupWithMember('acct-1');
+    const runId = await createRunningRun(groupId);
+
+    const script: AgentMessage[] = [
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'finish', input: { summary: 'done' } }] },
+    ];
+    const deps = makeDeps(new MockAgentClient(script));
+    await runAgent(deps, runId);
+
+    const { rows } = await pool.query<{ type: string; payload: { status: string; endReason: string | null } }>(
+      `SELECT type, payload FROM web_events
+       WHERE type = 'agent_run' AND payload->>'runId' = $1
+       ORDER BY seq ASC`,
+      [runId],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.payload.status).toBe('finished');
+    expect(rows[0]!.payload.endReason).toBe('final');
+  });
+
   it('BAD_JSON：追加 user PROTOCOL_ERROR 块，不计 assistant 块', async () => {
     const { groupId } = await seedGroupWithMember('acct-1');
     const runId = await createRunningRun(groupId);

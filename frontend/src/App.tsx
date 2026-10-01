@@ -2,10 +2,12 @@
  * 应用骨架：会话恢复、路由、布局（侧边导航）。
  *
  * 路由：
- *   /login        登录页（未登录）
- *   /accounts     账号列表（页面 2）
- *   /groups       群列表（导航用，便于进入群详情）
- *   /groups/:id   群详情（页面 3）
+ *   /login                       登录页（未登录）
+ *   /accounts                    账号列表（页面 2）
+ *   /groups                      群列表（导航用，便于进入群详情）
+ *   /groups/:id                  群详情（页面 3）
+ *   /agent-runs/:id              Agent 运行步骤详情（页面 4）
+ *   /groups/:id/sequences        序列运行：预检/启动/进度（页面 5）
  */
 import { useEffect, useState } from 'react';
 import { Link, Navigate, NavLink, Route, Routes, useNavigate } from 'react-router-dom';
@@ -20,6 +22,8 @@ import LoginPage from './pages/Login';
 import AccountsPage from './pages/Accounts';
 import GroupsPage from './pages/Groups';
 import GroupDetailPage from './pages/GroupDetail';
+import AgentRunDetailPage from './pages/AgentRunDetail';
+import SequencePage from './pages/SequencePage';
 
 export default function App() {
   const [session, setSession] = useState<SessionInfo | null>(null);
@@ -83,6 +87,8 @@ export default function App() {
           <Route path="/accounts" element={<AccountsPage session={session} />} />
           <Route path="/groups" element={<GroupsPage />} />
           <Route path="/groups/:id" element={<GroupDetailPage session={session} />} />
+          <Route path="/agent-runs/:id" element={<AgentRunDetailPage />} />
+          <Route path="/groups/:id/sequences" element={<SequencePage session={session} />} />
           <Route path="*" element={<Navigate to="/accounts" replace />} />
         </Routes>
         <p className="hint">
