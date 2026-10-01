@@ -27,7 +27,15 @@ import { EventsInboxRepo, type InboxRow } from '../repos/events-inbox.js';
 import { enqueueWebEvent } from '../repos/web-events.js';
 import type { LoggerLike } from '../services/gateway-client.js';
 import { dispatch } from '../services/event-handlers/index.js';
-import type { HandlerContext } from '../services/event-handlers/types.js';
+import type { HandlerContext, MediaConfig } from '../services/event-handlers/types.js';
+
+/** C1 媒体默认配置（测试未显式传入时使用）。 */
+const DEFAULT_MEDIA_CONFIG: MediaConfig = {
+  mediaDir: '/tmp/mamp-media-test',
+  mediaRetentionDays: 30,
+  mediaCleanIntervalSeconds: 3600,
+  gatewayUrl: 'http://unused',
+};
 
 export interface EventConsumerOptions {
   /** SSE 重连退避基数（毫秒），默认 500。 */
@@ -53,6 +61,7 @@ export class EventConsumer {
     private readonly gatewayUrl: string,
     log: LoggerLike,
     options: EventConsumerOptions = {},
+    private readonly mediaConfig: MediaConfig = DEFAULT_MEDIA_CONFIG,
   ) {
     this.inboxRepo = new EventsInboxRepo(pool);
     this.log = log;
@@ -275,7 +284,7 @@ export class EventConsumer {
     const client: PoolClient = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const ctx: HandlerContext = { client, pool: this.pool, log: this.log };
+      const ctx: HandlerContext = { client, pool: this.pool, log: this.log, media: this.mediaConfig };
       await dispatch(ctx, row.type, row.payload);
       await this.inboxRepo.markProcessed(client, row.eventId);
       await client.query('COMMIT');

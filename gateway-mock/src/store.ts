@@ -22,6 +22,7 @@ import type {
   Invite,
   MessageRecord,
   ClientMsgRef,
+  MediaRecord,
   ReinjectEntry,
 } from './types.js';
 
@@ -40,6 +41,9 @@ const messages = new Map<string, MessageRecord>();
 
 /** `${groupId}::${clientMsgId}` -> ClientMsgRef[]，保留全部，查询时返回最早一条 */
 const clientMsgIndex = new Map<string, ClientMsgRef[]>();
+
+/** mediaId -> MediaRecord（C1 媒体文件，GET /media/:id） */
+const mediaFiles = new Map<string, MediaRecord>();
 
 /** 行为开关（由 /_mock/behavior 控制）。 */
 export const behavior = {
@@ -626,12 +630,80 @@ export function findByClientMsgId(groupId: string, clientMsgId: string): ClientM
   return sorted[0] ?? null;
 }
 
+// ---------------------------------------------------------------------------
+// 媒体文件（C1 选做）：GET /media/:id
+// ---------------------------------------------------------------------------
+
+/**
+ * 从 mediaUrl 解析 mediaId。mediaUrl 形如 `/media/<id>`（相对）或
+ * `http://<host>/media/<id>`（绝对）。解析不出返回 null。
+ */
+export function mediaIdFromUrl(mediaUrl: string): string | null {
+  let pathname: string;
+  try {
+    // 相对路径（以 / 开头）直接用；绝对路径交给 URL 解析
+    pathname = mediaUrl.startsWith('/') ? mediaUrl : new URL(mediaUrl).pathname;
+  } catch {
+    return null;
+  }
+  const m = /^\/media\/([^/]+)$/.exec(pathname);
+  return m !== null ? decodeURIComponent(m[1]!) : null;
+}
+
+/**
+ * 注册一个媒体文件（已存在则原样返回）。
+ * 不指定内容时按 mediaId 确定性生成默认字节，保证测试可重复。
+ */
+export function registerMedia(
+  mediaId: string,
+  options: { contentType?: string; content?: Buffer | string } = {},
+): MediaRecord {
+  const existing = mediaFiles.get(mediaId);
+  if (existing !== undefined) return existing;
+  const bytes = options.content !== undefined
+    ? Buffer.from(options.content)
+    : Buffer.from(`mock media content for ${mediaId}\n`, 'utf8');
+  const record: MediaRecord = {
+    mediaId,
+    contentType: options.contentType ?? 'application/octet-stream',
+    bytes,
+    expired: false,
+  };
+  mediaFiles.set(mediaId, record);
+  return record;
+}
+
+/**
+ * 取媒体文件用于下载。未注册或已过期 → 404 GatewayError（题面：过期后返回 404）。
+ */
+export function getMedia(mediaId: string): MediaRecord {
+  const record = mediaFiles.get(mediaId);
+  if (record === undefined || record.expired) {
+    throw new GatewayError(404, 'NOT_FOUND');
+  }
+  return record;
+}
+
+/** 标记媒体已过期。返回是否命中已注册文件。 */
+export function expireMedia(mediaId: string): boolean {
+  const record = mediaFiles.get(mediaId);
+  if (record === undefined) return false;
+  record.expired = true;
+  return true;
+}
+
 /**
  * 为一组消息补投事件：使用原始 msgId/sentAt，但分配**新的（更大的）eventId**。
  * 这正是题面描述的"离线账号之前发过的消息之后通过事件流补投"。
  */
 export function reinjectMessages(entries: readonly ReinjectEntry[]): void {
   for (const entry of entries) {
+    // 带 mediaUrl 时确保对应媒体可下载（未显式注册就生成默认内容），
+    // 否则后端下载只拿到 404，无法验证 C1 正向链路。
+    if (entry.mediaUrl != null) {
+      const mediaId = mediaIdFromUrl(entry.mediaUrl);
+      if (mediaId !== null) registerMedia(mediaId);
+    }
     const msgId = recordMessage({
       groupId: entry.groupId,
       senderPlatformUserId: entry.senderPlatformUserId,
@@ -773,6 +845,7 @@ export function resetState(): void {
   groups.clear();
   messages.clear();
   clientMsgIndex.clear();
+  mediaFiles.clear();
   oneShotFaults.kickTimeoutGroups.clear();
   behavior.joinNeverArrives = config.joinNeverArrivesProbability;
   behavior.failJoinOnce = false;

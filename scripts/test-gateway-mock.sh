@@ -11,6 +11,7 @@
 #   故障  503 注入（send / by-client-id）
 #   事件  shuffle-mode 全部到达且 eventId 唯一 / replay 补投旧 sentAt 消息 /
 #         break-connection 后 since 补拉 / suspend 移出群+403 / external-join 推 member_joined
+#   C1    /media/:id 200 返回字节；未注册/expire 后 404
 #
 # 前提：docker compose 已启动（gateway-mock 健康）。
 # 用法：./scripts/test-gateway-mock.sh
@@ -317,7 +318,24 @@ HAS_EXT=$(stateq "j.groups.find(g=>g.groupId===\"$GROUP_ID\").members.some(m=>m.
 [ "$HAS_EXT" = "true" ] || fail "members 应包含 pu_ext_user"
 log "外部用户 pu_ext_user 进群，member_joined 已推送"
 
+step "步骤 16：C1 媒体契约 —— GET /media/:id 字节下载；未注册/过期 404"
+# 注册自定义内容
+curl -sf -X POST "$GATEWAY_URL/_mock/media" -H 'content-type: application/json' \
+  -d '{"id":"tmedia-1","contentType":"text/plain","content":"media-body-123"}' >/dev/null
+CODE=$(http_code "$GATEWAY_URL/media/tmedia-1")
+[ "$CODE" = "200" ] || fail "已注册媒体应 200，实际 $CODE"
+BODY=$(curl -sf "$GATEWAY_URL/media/tmedia-1")
+[ "$BODY" = "media-body-123" ] || fail "媒体内容应为 media-body-123，实际 $BODY"
+CODE=$(http_code "$GATEWAY_URL/media/never-registered-id")
+[ "$CODE" = "404" ] || fail "未注册媒体应 404，实际 $CODE"
+# 标记过期 → 404
+EXPIRED=$(curl -sf -X POST "$GATEWAY_URL/_mock/media/tmedia-1/expire")
+grep -q '"ok":true' <<<"$EXPIRED" || fail "expire 应返回 ok:true，实际 $EXPIRED"
+CODE=$(http_code "$GATEWAY_URL/media/tmedia-1")
+[ "$CODE" = "404" ] || fail "过期媒体应 404，实际 $CODE"
+log "媒体下载 200/内容正确；未注册与过期均 404"
+
 echo ""
 echo "============================================================"
-echo "PASS: 网关模拟器自测全部通过（契约 + S1–S5 网关侧 + 故障/事件行为）"
+echo "PASS: 网关模拟器自测全部通过（契约 + S1–S5 网关侧 + 故障/事件 + C1 媒体）"
 echo "============================================================"

@@ -63,6 +63,80 @@ export async function upsertMessage(client: PoolClient, msg: MessageUpsert): Pro
 }
 
 // -------------------------------------------------------------------------
+// C1 媒体：本地文件路径维护（5.25）
+// -------------------------------------------------------------------------
+
+/** 查一条消息已下载的本地路径；未下载返回 null。 */
+export async function getMessageLocalPath(
+  queryable: Pool | PoolClient,
+  groupId: string,
+  msgId: string,
+): Promise<string | null> {
+  const { rows } = await queryable.query<{ local_file_path: string | null }>(
+    `SELECT local_file_path FROM messages
+     WHERE group_id = $1 AND msg_id = $2`,
+    [groupId, msgId],
+  );
+  return rows[0]?.local_file_path ?? null;
+}
+
+/** 下载成功后回写本地路径与下载时刻。 */
+export async function setMessageLocalFile(
+  client: PoolClient,
+  groupId: string,
+  msgId: string,
+  filePath: string,
+): Promise<void> {
+  await client.query(
+    `UPDATE messages
+       SET local_file_path = $1, media_downloaded_at = now()
+     WHERE group_id = $2 AND msg_id = $3`,
+    [filePath, groupId, msgId],
+  );
+}
+
+/** 清理删除文件后：置空路径（不留指向已删文件的记录）。 */
+export async function clearMessageLocalFile(
+  client: PoolClient,
+  groupId: string,
+  msgId: string,
+): Promise<void> {
+  await client.query(
+    `UPDATE messages SET local_file_path = NULL
+     WHERE group_id = $1 AND msg_id = $2`,
+    [groupId, msgId],
+  );
+}
+
+/** 到期媒体候选：已下载且下载时刻早于 cutoff 的消息。 */
+export interface ExpiredMediaRow {
+  readonly groupId: string;
+  readonly msgId: string;
+  readonly localFilePath: string;
+}
+
+export async function listExpiredMedia(
+  pool: Pool,
+  cutoff: Date,
+): Promise<ExpiredMediaRow[]> {
+  const { rows } = await pool.query<{
+    group_id: string;
+    msg_id: string;
+    local_file_path: string;
+  }>(
+    `SELECT group_id, msg_id, local_file_path FROM messages
+     WHERE local_file_path IS NOT NULL AND media_downloaded_at < $1
+     ORDER BY media_downloaded_at ASC`,
+    [cutoff],
+  );
+  return rows.map((r) => ({
+    groupId: r.group_id,
+    msgId: r.msg_id,
+    localFilePath: r.local_file_path,
+  }));
+}
+
+// -------------------------------------------------------------------------
 // 时间线分页（规划 04 §3.1，任务 4.10）
 // -------------------------------------------------------------------------
 

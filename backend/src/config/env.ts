@@ -23,6 +23,15 @@ export interface AppConfig {
   readonly accessTokenTtlSeconds: number;
   /** pino 日志级别 */
   readonly logLevel: LogLevel;
+  /**
+   * C1 媒体：本地下载目录（默认 /app/media，容器内）。
+   * compose 给该目录挂载 named volume，容器重建文件不丢。
+   */
+  readonly mediaDir: string;
+  /** C1 媒体：文件保留天数，默认 30（下载时刻起算）。 */
+  readonly mediaRetentionDays: number;
+  /** C1 媒体：清理扫描周期（秒），默认 3600。 */
+  readonly mediaCleanIntervalSeconds: number;
 }
 
 const LOG_LEVELS = ['fatal', 'error', 'warn', 'info', 'debug', 'trace'] as const;
@@ -70,6 +79,14 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
 
   const port = optionalInt('PORT', 3000, 1, 65535);
   const accessTokenTtlSeconds = optionalInt('ACCESS_TOKEN_TTL_SECONDS', 900, 1, 86_400);
+
+  // C1 媒体配置（全部有默认值，不配置也能正常启动）
+  const mediaDirRaw = source['MEDIA_DIR'];
+  const mediaDir = mediaDirRaw !== undefined && mediaDirRaw.trim() !== ''
+    ? mediaDirRaw.trim()
+    : '/app/media';
+  const mediaRetentionDays = optionalInt('MEDIA_RETENTION_DAYS', 30, 1, 3650);
+  const mediaCleanIntervalSeconds = optionalInt('MEDIA_CLEAN_INTERVAL_SECONDS', 3600, 10, 86_400);
 
   const databaseUrl = required('DATABASE_URL');
   const gatewayUrl = required('GATEWAY_URL');
@@ -125,5 +142,8 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     jwtSecret: jwtSecret as string,
     accessTokenTtlSeconds,
     logLevel,
+    mediaDir,
+    mediaRetentionDays,
+    mediaCleanIntervalSeconds,
   };
 }

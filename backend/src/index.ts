@@ -30,6 +30,8 @@ import { AccountRepo } from './repos/accounts.js';
 import { AgentRunnerWorker } from './workers/agent-runner-worker.js';
 import { SequenceRunnerWorker } from './workers/sequence-runner-worker.js';
 import { SequenceRepo } from './repos/sequences.js';
+import { mkdir } from 'node:fs/promises';
+import { MediaCleaner } from './workers/media-cleaner.js';
 
 async function main(): Promise<void> {
   let config: AppConfig;
@@ -59,7 +61,10 @@ async function main(): Promise<void> {
 
   const pool = getPool(config.databaseUrl);
 
-  // WebSocket 连接中心：被 WS 路由（登记连接）与 WsPublisher（广播）共享
+  // C1 媒体：确保本地下载目录存在（compose 给它挂 named volume）
+  await mkdir(config.mediaDir, { recursive: true });
+
+  // WebSocket 连接中心：被 WS 路由（登记连接）与 WsHub（广播）共享
   const wsHub = new WsHub();
 
   // 后台 worker：限流到期自动恢复 online（崩溃安全，1s 周期扫描 DB）
@@ -97,11 +102,18 @@ async function main(): Promise<void> {
   reconcileWorker.start();
 
   // 后台 worker：事件消费（SSE 事件入 inbox + 幂等消费，INV-4）
+  // 第 5 个参数为 C1 媒体配置（相对 mediaUrl 的补全/下载目录）
   const eventConsumer = new EventConsumer(
     pool,
     config.gatewayUrl,
     app.log.child({ worker: 'event-consumer' }),
     { batchSize: 50, intervalMs: 200, reconnectBaseMs: 500, reconnectMaxMs: 5000 },
+    {
+      mediaDir: config.mediaDir,
+      mediaRetentionDays: config.mediaRetentionDays,
+      mediaCleanIntervalSeconds: config.mediaCleanIntervalSeconds,
+      gatewayUrl: config.gatewayUrl,
+    },
   );
   eventConsumer.start();
 
@@ -162,6 +174,17 @@ async function main(): Promise<void> {
   }, 500);
   sequenceRunnerWorker.start();
 
+  // 后台 worker：C1 媒体清理（超保留期删除；running run 关联文件保护）
+  const mediaCleaner = new MediaCleaner(
+    pool,
+    new AgentRunRepo(pool),
+    config.mediaDir,
+    config.mediaRetentionDays,
+    config.mediaCleanIntervalSeconds,
+    app.log.child({ worker: 'media-cleaner' }),
+  );
+  mediaCleaner.start();
+
   // --- 优雅退出 ---
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -178,6 +201,7 @@ async function main(): Promise<void> {
       wsPublisher.stop();
       agentRunnerWorker.stop();
       sequenceRunnerWorker.stop();
+      mediaCleaner.stop();
       await app.close();
       await closePool();
       process.exit(0);

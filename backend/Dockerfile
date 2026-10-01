@@ -26,6 +26,11 @@ RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force
 COPY --from=build /app/dist ./dist
 COPY migrations ./migrations
 
+# C1 媒体目录：预建并交给 node 用户。
+# Docker 初始化 named volume（compose 挂载 media:/app/media）时会继承镜像中
+# 挂载点目录的属主与权限——否则目录归 root，非 root 进程写入会被 EACCES 拒绝。
+RUN mkdir -p /app/media && chown node:node /app/media
+
 # 以非 root 用户运行
 USER node
 

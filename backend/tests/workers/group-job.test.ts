@@ -21,6 +21,7 @@ import { JobRepo } from '../../src/repos/jobs.js';
 import { GroupRepo } from '../../src/repos/groups.js';
 import { AccountRepo } from '../../src/repos/accounts.js';
 import { handleMemberJoined } from '../../src/services/event-handlers/member-joined.js';
+import type { MediaConfig } from '../../src/services/event-handlers/types.js';
 import { pool, queryOne, resetDb } from '../helpers/db.js';
 
 const silentLog: LoggerLike = {
@@ -28,6 +29,14 @@ const silentLog: LoggerLike = {
   info: () => {},
   warn: () => {},
   error: () => {},
+};
+
+/** 测试用媒体配置：member_joined handler 不使用其中字段，满足 HandlerContext 即可。 */
+const TEST_MEDIA_CONFIG: MediaConfig = {
+  mediaDir: '/tmp/mamp-media-unused',
+  mediaRetentionDays: 30,
+  mediaCleanIntervalSeconds: 3600,
+  gatewayUrl: 'http://unused',
 };
 
 class FakeGroupGateway implements GroupGateway {
@@ -350,7 +359,7 @@ describe('GroupJobWorker', () => {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      const ctx = { client, pool, log: silentLog };
+      const ctx = { client, pool, log: silentLog, media: TEST_MEDIA_CONFIG };
       await handleMemberJoined(ctx, { groupId: 'gw-grp-1', platformUserId: 'pu_acct-2' });
       await client.query('COMMIT');
     } finally {
@@ -370,7 +379,7 @@ describe('GroupJobWorker', () => {
     const client2 = await pool.connect();
     try {
       await client2.query('BEGIN');
-      const ctx = { client: client2, pool, log: silentLog };
+      const ctx = { client: client2, pool, log: silentLog, media: TEST_MEDIA_CONFIG };
       await handleMemberJoined(ctx, { groupId: 'gw-grp-1', platformUserId: 'pu_acct-3' });
       await client2.query('COMMIT');
     } finally {

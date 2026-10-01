@@ -10,8 +10,13 @@
  */
 import { GroupRepo } from '../../repos/groups.js';
 import { AgentRunRepo } from '../../repos/agent-runs.js';
-import { upsertMessage } from '../../repos/messages.js';
+import {
+  upsertMessage,
+  getMessageLocalPath,
+  setMessageLocalFile,
+} from '../../repos/messages.js';
 import { enqueueWebEvent } from '../../repos/web-events.js';
+import { downloadMedia } from '../media-downloader.js';
 import type { HandlerContext } from './types.js';
 import { asRecord, reqStr, nullableStr, reqDate } from './types.js';
 
@@ -48,6 +53,24 @@ export async function handleMessage(ctx: HandlerContext, payload: unknown): Prom
     mediaUrl: mediaUrl ?? null,
   });
 
+  // ---- C1 媒体：带 mediaUrl 时下载到本地（事件重投幂等：已下载就跳过） ----
+  // 下载失败不抛错阻塞事件消费（媒体是选做增强），记日志后路径保持 NULL，
+  // 后续重复事件/补救处理仍有机会重新下载。
+  if (mediaUrl !== undefined) {
+    const existingPath = await getMessageLocalPath(ctx.client, group.id, msgId);
+    if (existingPath === null) {
+      const outcome = await downloadMedia(mediaUrl, ctx.media.mediaDir, ctx.media.gatewayUrl);
+      if (outcome.kind === 'downloaded') {
+        await setMessageLocalFile(ctx.client, group.id, msgId, outcome.filePath);
+      } else {
+        ctx.log.warn(
+          { groupId: group.id, msgId, mediaUrl, reason: outcome.kind },
+          'handler: 媒体下载未成功，路径保持 NULL',
+        );
+      }
+    }
+  }
+
   // 非自己消息 + agentEnabled → 触发 agent run
   let newAgentRunId: string | null = null;
   if (!isOwn && group.agentEnabled) {
@@ -62,7 +85,10 @@ export async function handleMessage(ctx: HandlerContext, payload: unknown): Prom
         await agentRunRepo.addPendingMessage(ctx.client, runningRun.id, msgId);
       }
     } else {
-      // run !== null → 新 run 已创建，由 agent-runner-worker 轮询执行
+      // run !== null → 新 run 已创建，由 agent-runner-worker 轮询执行。
+      // 触发消息同时记入 pending：该表即"run 关联消息全集"，
+      // 媒体清理 worker 据此保证运行中 run 用到的文件不被删除。
+      await agentRunRepo.addPendingMessage(ctx.client, run.id, msgId);
       newAgentRunId = run.id;
     }
   }

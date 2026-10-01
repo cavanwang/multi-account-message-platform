@@ -105,6 +105,18 @@ export interface ClientMsgRef {
 }
 
 /**
+ * 一个可通过 `GET /media/:id` 下载的媒体文件（C1 选做）。
+ * 题面：正常返回文件字节；未注册或已过期后返回 404。
+ */
+export interface MediaRecord {
+  readonly mediaId: string;
+  readonly contentType: string;
+  readonly bytes: Buffer;
+  /** true = 已过期（/_mock/media/:id/expire），GET 返回 404。 */
+  expired: boolean;
+}
+
+/**
  * 补投消息的输入形状（`/_mock/messages/inject`）。
  * 与 MessageRecord 的区别：调用方不提供 msgId（由模拟器分配）。
  */

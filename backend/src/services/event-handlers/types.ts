@@ -13,12 +13,22 @@ import type { LoggerLike } from '../gateway-client.js';
  * handler 上下文：
  *  - client：本事件的业务事务连接（所有 DB 写 + web_event 都在其中，INV-5）；
  *  - pool：终态服务 markTerminal 需要自持事务（advisory lock 串行化），不能用 client；
- *  - log：结构化日志。
+ *  - log：结构化日志；
+ *  - media：C1 媒体下载所需配置（目录/保留天数）。
  */
+export interface MediaConfig {
+  readonly mediaDir: string;
+  readonly mediaRetentionDays: number;
+  readonly mediaCleanIntervalSeconds: number;
+  /** 媒体所在网关地址：相对 mediaUrl（`/media/x`）按它补全。 */
+  readonly gatewayUrl: string;
+}
+
 export interface HandlerContext {
   readonly client: PoolClient;
   readonly pool: Pool;
   readonly log: LoggerLike;
+  readonly media: MediaConfig;
 }
 
 export type EventHandler = (ctx: HandlerContext, payload: unknown) => Promise<void>;

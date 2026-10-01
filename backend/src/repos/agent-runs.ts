@@ -259,6 +259,20 @@ export class AgentRunRepo {
     await client.query('DELETE FROM agent_run_pending_messages WHERE run_id = $1', [runId]);
   }
 
+  /**
+   * 所有 running run 在 pending 表中关联的 msg_id 全集。
+   * 媒体清理 worker 据此保护"仍可能被运行中 agent run 用到"的文件。
+   */
+  async listMsgIdsReferencedByRunningRuns(queryable: Pool | PoolClient): Promise<string[]> {
+    const { rows } = await queryable.query<{ msg_id: string }>(
+      `SELECT p.msg_id
+         FROM agent_run_pending_messages p
+         JOIN agent_runs r ON r.id = p.run_id
+        WHERE r.status = 'running'`,
+    );
+    return rows.map((r) => r.msg_id);
+  }
+
   // --- tool calls (幂等键) ---
 
   /** 查同 run 同 idempotency_key 的工具调用记录。 */

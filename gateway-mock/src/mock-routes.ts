@@ -23,6 +23,8 @@ import {
   reinjectMessages,
   seedAccounts,
   getAccount,
+  registerMedia,
+  expireMedia,
 } from './store.js';
 import { sendError, sendJson, readJsonBody, activeConnectionCount } from './lib/http.js';
 import * as bus from './lib/event-bus.js';
@@ -155,6 +157,29 @@ export async function handle(req: IncomingMessage, res: ServerResponse, url: URL
       reinjectMessages(entries);
       return { ok: true, injected: entries.length };
     });
+  }
+
+  // --- 注册自定义媒体文件（指定字节/类型；id 对应 GET /media/:id） ---
+  if (path === '/_mock/media' && method === 'POST') {
+    return wrap(res, async () => {
+      const body = await readJsonBody(req);
+      const id = typeof body['id'] === 'string' ? body['id'] : '';
+      if (id === '') throw new Error('_mock/media: id 必填');
+      // exactOptionalPropertyTypes：按字段是否存在逐个挂入，不能显式传 undefined
+      const options: { contentType?: string; content?: string } = {};
+      if (typeof body['contentType'] === 'string') options.contentType = body['contentType'];
+      if (typeof body['content'] === 'string') options.content = body['content'];
+      const media = registerMedia(id, options);
+      return { ok: true, mediaId: media.mediaId, bytes: media.bytes.length };
+    });
+  }
+
+  // --- 标记媒体过期：之后 GET /media/:id 返回 404 ---
+  const em = /^\/_mock\/media\/([^/]+)\/expire$/.exec(path);
+  if (em && method === 'POST') {
+    const hit = expireMedia(decodeURIComponent(em[1]!));
+    sendJson(res, 200, { ok: hit });
+    return true;
   }
 
   // --- 事件流行为 ---

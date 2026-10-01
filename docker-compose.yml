@@ -46,6 +46,10 @@ services:
       JWT_SECRET: dev-only-insecure-secret-change-me
       ACCESS_TOKEN_TTL_SECONDS: "900"
       LOG_LEVEL: info
+      # C1 媒体（选做）：下载目录/保留天数/清理周期
+      MEDIA_DIR: /app/media
+      MEDIA_RETENTION_DAYS: "30"
+      MEDIA_CLEAN_INTERVAL_SECONDS: "3600"
     # 先跑 migration，再启动服务；migration 可重复执行
     command: sh -c "node dist/db/migrate-cli.js up && node dist/index.js"
     ports:
@@ -53,6 +57,9 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    volumes:
+      # C1 媒体：容器重建后已下载文件不丢，清理按保留天数执行
+      - media:/app/media
     restart: unless-stopped
 
   # --- 以下三个服务当前为占位，后续切片替换 ---
@@ -87,3 +94,4 @@ services:
 
 volumes:
   pgdata:
+  media:

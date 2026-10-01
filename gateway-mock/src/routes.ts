@@ -30,6 +30,7 @@ import {
   landMessage,
   findByClientMsgId,
   consumeKickTimeout,
+  getMedia,
   sleep,
 } from './store.js';
 import { randBetween, timing } from './lib/timing.js';
@@ -52,6 +53,29 @@ export async function handle(req: IncomingMessage, res: ServerResponse, url: URL
     const since = sinceRaw === null ? bus.lastEventId() : Number(sinceRaw);
     openEventStream(res, bus, Number.isFinite(since) ? since : bus.lastEventId());
     return true;
+  }
+
+  // --- 媒体文件（C1 选做）：GET /media/:id → 文件字节；过期/未注册 → 404 ---
+  const mm = /^\/media\/([^/]+)$/.exec(path);
+  if (mm && method === 'GET') {
+    const mediaId = decodeURIComponent(mm[1]!);
+    try {
+      const media = getMedia(mediaId);
+      res.writeHead(200, {
+        'content-type': media.contentType,
+        'content-length': String(media.bytes.length),
+      });
+      res.end(media.bytes);
+      return true;
+    } catch (err) {
+      if (err instanceof GatewayError) {
+        sendError(res, err.status, err.code, err.extra);
+        return true;
+      }
+      console.error('[gateway] /media 未预期异常:', err);
+      sendError(res, 500, 'INTERNAL_ERROR');
+      return true;
+    }
   }
 
   // --- 账号 ---

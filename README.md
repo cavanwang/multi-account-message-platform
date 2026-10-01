@@ -52,7 +52,7 @@ docker compose down -v
 
 ```bash
 curl http://localhost:3000/api/health
-# 期望：{"ok":true,"schemaVersion":12}
+# 期望：{"ok":true,"schemaVersion":13}
 ```
 
 ### 1. 登录与权限
@@ -212,6 +212,31 @@ curl -X POST http://localhost:3100/_mock/faults -H 'Content-Type: application/js
 # 也支持 mode:"503"/"delay"；{"clearAll":true} 清除所有已注册故障
 ```
 
+### 7. 媒体文件下载与清理（C1 选做）
+
+message 事件带 `mediaUrl` 时，后端自动把文件下载到本地 media 目录，路径记入消息行；
+超过保留天数（默认 30 天，可配）后由清理 worker 删除，运行中 agent run 关联的文件受保护。
+
+```bash
+# 注入一条带媒体的消息
+curl -X POST http://localhost:3100/_mock/messages/inject \
+  -H 'Content-Type: application/json' \
+  -d '[{"groupId":"<gatewayGroupId>","senderPlatformUserId":"u1","text":"pic",
+       "sentAt":"2026-01-01T00:00:01.000Z","mediaUrl":"/media/pic-1"}]'
+
+# 查看已下载文件（backend 容器内 MEDIA_DIR=/app/media，named volume 持久化）
+docker compose exec backend ls -l /app/media
+
+# 查看消息行的本地路径与下载时刻
+docker compose exec db psql -U app -d app -c \
+  "SELECT msg_id, local_file_path, media_downloaded_at FROM messages
+   WHERE local_file_path IS NOT NULL ORDER BY media_downloaded_at DESC;"
+```
+
+下载有 5 秒超时与 10MB 大小上限；媒体 404/网络故障不阻塞事件消费，路径保持 NULL，
+重复事件到达时可重新下载。相关环境变量：`MEDIA_DIR` / `MEDIA_RETENTION_DAYS` /
+`MEDIA_CLEAN_INTERVAL_SECONDS`（见 `.env.example`）。
+
 ## 一键脚本验证（题面场景 S1–S8）
 
 题面 `docs/examination_project.md` §2.4 的 8 个场景已全部脚本化，宿主机执行、只调容器 HTTP，
@@ -269,10 +294,10 @@ cd backend
 npm test
 ```
 
-当前共 222 个用例（21 个测试文件）。覆盖范围：账号状态机 6×6 转移表全枚举、
+当前共 230 个用例（22 个测试文件）。覆盖范围：账号状态机 6×6 转移表全枚举、
 CAS 乐观锁并发、终态原子事务、限流到期自动恢复、出站投递与 504 收敛、
 事件消费乱序/重复、建群 job、Agent 运行（审计/幂等/崩溃恢复/预算/取消/续跑 stepNo）、
-定时序列（占位符/黏性变量/账号选择/并发冲突）。
+定时序列（占位符/黏性变量/账号选择/并发冲突）、C1 媒体（下载幂等/到期清理/run 保护）。
 
 ## 数据库迁移约定
 
@@ -318,9 +343,11 @@ scripts/                 集成测试脚本
 - [x] **A6 前端页面 1–3**：登录 / 账号列表 / 群详情（React 18 + Vite）
 - [x] **B4 前端页面 4–5**：agent run 步骤详情、序列运行与预检；WebSocket 断线补齐验证
 - [x] **题面 S1–S8 场景脚本化**：两个 e2e 脚本一键复现（5.23），各两轮验证通过
+- [x] **C1 媒体文件（选做，5.25）**：mediaUrl 下载到本地 / 到期清理 / 运行中 run 保护
 
 ## 已知限制
 
 - 网关/Agent 模拟器的内部状态保存在内存中，**进程重启即清空**（题目未要求持久化）。
 - 当前 `JWT_SECRET` 为演示用固定值，生产环境应通过 secret 注入。
-- C 组选做项（C1 媒体文件、C2 真实 LLM、C3 Playwright）未实现。
+- C 组选做项 C2（真实 LLM 接入）、C3（Playwright 自动化）未实现。
+  C2 不建议启用：需要外网与付费 API key，且真实模型行为不可预测，会破坏 S1–S8 脚本的确定性。
