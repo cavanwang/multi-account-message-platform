@@ -11,6 +11,7 @@ import { AppError, ErrorCode, type ErrorResponseBody, type ErrorDetails } from '
 import { makeAuthHook } from './auth-hook.js';
 import { registerAuthRoutes } from './routes/auth.js';
 import { registerHealthRoutes } from './routes/health.js';
+import { registerAccountRoutes } from './routes/accounts.js';
 
 export interface ServerDeps {
   readonly config: AppConfig;
@@ -98,24 +99,14 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   // --- 受保护路由 ---
   // 用一个子上下文加 preHandler，避免逐个路由重复声明；
   // 后续切片的业务路由都注册在这个作用域内（注意：必须 await register，
-  // 否则钩子注册会晚于首次请求，出现"未鉴权就能访问"的空窗）。
+  // 否则钩子注册会晚于首次请求，出现“未鉴权就能访问”的空窗）。
   await app.register(async (protectedScope) => {
     protectedScope.addHook('preHandler', makeAuthHook(config));
-
-    // 切片 0 还没有业务写端点，这里放一个探针用于验证鉴权/授权钩子。
-    // 切片 2 补齐 /api/accounts 等真实路由后，可以删掉它（也可保留作为演练端点）。
-    protectedScope.get('/api/_ping', async (request) => ({
-      pong: true,
-      role: request.principal?.role,
-      username: request.principal?.username,
-    }));
-    protectedScope.post('/api/_ping', async (request) => ({
-      pong: true,
-      role: request.principal?.role,
-      username: request.principal?.username,
-    }));
-
-    // 切片 2 起在此注册：/api/accounts、/api/groups、/api/jobs ...
+  
+    // 切片 2：账号管理路由
+    await registerAccountRoutes(protectedScope, { config, pool });
+  
+    // 切片 3+ 在此注册：/api/groups、/api/jobs ...
   });
 
   return app;

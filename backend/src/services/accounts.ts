@@ -6,12 +6,14 @@
  *  - 每次改状态后立即调对应的网关接口（connect / disconnect / /_mock/suspend 等）
  *  - 网关只是执行层，不反向通知后端
  *  - CAS 冲突时自动重试（最多 3 次），重试前重新读取当前状态并重新判定转移合法性
+ *  - 终态后果（移出群、取消消息、跳过步骤）由 account-terminal.ts 的 markTerminal 处理
  */
 import type { Pool } from 'pg';
 import type { AppConfig } from '../config/env.js';
 import { AccountRepo, type AccountRow } from '../repos/accounts.js';
 import { assertCanTransition, isTerminal, type AccountStatus } from '../domain/account-fsm.js';
 import { AppError } from '../http/errors.js';
+import { markTerminal, type TerminalResult } from './account-terminal.js';
 
 export interface GatewayClient {
   connect(accountId: string): Promise<{ platformUserId: string }>;
@@ -72,17 +74,17 @@ export class AccountService {
    * 幂等：已断开返回成功；终态抛 403。
    */
   async disconnect(accountId: string): Promise<void> {
-    return this.withCASRetry(accountId, async (account) => {
+    await this.withCASRetry(accountId, async (account) => {
       if (isTerminal(account.status)) {
         throw AppError.forbidden(`账号 ${accountId} 已进入终态 ${account.status}，无法 disconnect`);
       }
-      if (account.status === 'disconnected') return {}; // 幂等
+      if (account.status === 'disconnected') return true; // 幂等
 
       assertCanTransition(account.status, 'disconnected');
       await this.gateway.disconnect(accountId);
       const updated = await this.repo.transitionCAS(accountId, account.version, 'disconnected');
       if (updated === null) return null;
-      return {};
+      return true;
     });
   }
 
@@ -94,9 +96,9 @@ export class AccountService {
     accountId: string,
     retryAfterSeconds: number,
   ): Promise<void> {
-    return this.withCASRetry(accountId, async (account) => {
-      if (isTerminal(account.status)) return {}; // 终态不再转移
-      if (account.status === 'rate_limited') return {}; // 幂等
+    await this.withCASRetry(accountId, async (account) => {
+      if (isTerminal(account.status)) return true; // 终态不再转移
+      if (account.status === 'rate_limited') return true; // 幂等
 
       assertCanTransition(account.status, 'rate_limited');
       await this.gateway.setRateLimit(accountId, retryAfterSeconds);
@@ -106,52 +108,41 @@ export class AccountService {
         retryAfterSeconds,
       });
       if (updated === null) return null;
-      return {};
+      return true;
     });
   }
 
   /**
    * 终态转移：任意状态 → suspended / session_expired。
-   * 原子后果：调网关 /_mock 端点 → 网关移出所有群 + 推 member_left → 后端监听到后删成员。
-   * 这里只做第一步，后续由事件消费者完成。
+   * 调用 markTerminal 执行原子后果（移出群、取消消息、跳过步骤、入队事件）。
    */
-  async suspend(accountId: string, opts: { pushAccountStatus?: boolean } = {}): Promise<void> {
-    return this.markTerminal(accountId, 'suspended', opts);
+  async suspend(accountId: string, opts: { pushAccountStatus?: boolean } = {}): Promise<TerminalResult> {
+    return this.markTerminalWithGateway(accountId, 'suspended', opts);
   }
 
-  async sessionExpire(accountId: string, opts: { pushAccountStatus?: boolean } = {}): Promise<void> {
-    return this.markTerminal(accountId, 'session_expired', opts);
+  async sessionExpire(accountId: string, opts: { pushAccountStatus?: boolean } = {}): Promise<TerminalResult> {
+    return this.markTerminalWithGateway(accountId, 'session_expired', opts);
   }
 
-  private async markTerminal(
+  /**
+   * 终态转移的完整流程：
+   * 1. 调网关 /_mock 端点让网关也标记终态
+   * 2. 执行本地终态原子后果（事务）
+   */
+  private async markTerminalWithGateway(
     accountId: string,
     terminalStatus: 'suspended' | 'session_expired',
     opts: { pushAccountStatus?: boolean } = {},
-  ): Promise<void> {
-    return this.withCASRetry(accountId, async (account) => {
-      if (isTerminal(account.status)) {
-        // 幂等：已是终态，确保网关侧也一致
-        if (terminalStatus === 'suspended') {
-          await this.gateway.suspend(accountId, opts);
-        } else {
-          await this.gateway.sessionExpire(accountId, opts);
-        }
-        return {};
-      }
+  ): Promise<TerminalResult> {
+    // 先调网关（网关侧标记后会自动移出群并推 member_left）
+    if (terminalStatus === 'suspended') {
+      await this.gateway.suspend(accountId, opts);
+    } else {
+      await this.gateway.sessionExpire(accountId, opts);
+    }
 
-      assertCanTransition(account.status, terminalStatus);
-      if (terminalStatus === 'suspended') {
-        await this.gateway.suspend(accountId, opts);
-      } else {
-        await this.gateway.sessionExpire(accountId, opts);
-      }
-      const updated = await this.repo.transitionCAS(accountId, account.version, terminalStatus, {
-        rateLimitedUntil: null,
-        retryAfterSeconds: null,
-      });
-      if (updated === null) return null;
-      return {};
-    });
+    // 执行本地终态原子后果
+    return markTerminal(this.pool, accountId, terminalStatus, 'operator');
   }
 
   /**
@@ -179,7 +170,9 @@ export class AccountService {
       }
 
       if (attempt < maxRetries) {
-        await new Promise((resolve) => setTimeout(resolve, 50 * attempt));
+        // 延迟重试，避免快速连续冲突
+        // eslint-disable-next-line no-promise-executor-return
+        await new Promise((r) => setTimeout(r, 50 * attempt));
       }
     }
     throw new Error(`账号 ${accountId} CAS 冲突，重试 ${maxRetries} 次后仍失败`);
