@@ -5,7 +5,7 @@
  * beforeEach 调 resetDb() 把业务表清空到与"全新迁移后"等价的状态。
  */
 import { randomUUID } from 'node:crypto';
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 import { afterAll } from 'vitest';
 
 export const TEST_DATABASE_URL =
@@ -162,4 +162,95 @@ export async function armStepUpdateFailure(ruleName = 'trg_fail_steps_update'): 
     await pool.query(`DROP TRIGGER IF EXISTS ${ruleName} ON sequence_steps`);
     await pool.query('DROP FUNCTION IF EXISTS fail_steps_update()');
   };
+}
+
+/**
+ * 在共享池上跑一个事务：BEGIN → fn → COMMIT，异常则 ROLLBACK。
+ * claimQueued 等必须在事务内调用的 repo 方法用它包裹。
+ */
+export async function withTx<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * 建群并把账号置为 online 加入（成员 role=member，platformUserId 自动生成）。
+ * 返回两侧 UUID 与网关群 ID。
+ */
+export async function seedGroupWithMember(
+  accountId = 'acct-1',
+): Promise<{ accountUuid: string; groupId: string; gatewayGroupId: string }> {
+  const { rows: accountRows } = await pool.query<{ id: string }>(
+    `UPDATE accounts SET status='online', platform_user_id='pu_' || account_id
+     WHERE account_id=$1 RETURNING id`,
+    [accountId],
+  );
+  const accountUuid = accountRows[0]?.id;
+  if (accountUuid === undefined) throw new Error(`seed 账号 ${accountId} 不存在`);
+
+  const gatewayGroupId = `grp_${randomUUID()}`;
+  const { rows: groupRows } = await pool.query<{ id: string }>(
+    `INSERT INTO groups (gateway_group_id, creator_account_id) VALUES ($1, $2) RETURNING id`,
+    [gatewayGroupId, accountUuid],
+  );
+  const groupId = groupRows[0]?.id;
+  if (groupId === undefined) throw new Error('建群失败');
+
+  await pool.query(
+    `INSERT INTO group_members (group_id, account_id, platform_user_id, role)
+     VALUES ($1, $2, $3, 'member')`,
+    [groupId, accountUuid, `pu_${accountId}`],
+  );
+
+  return { accountUuid, groupId, gatewayGroupId };
+}
+
+export interface OutboxSeedOptions {
+  readonly status?: 'queued' | 'accepted' | 'sent' | 'failed' | 'unknown' | 'cancelled';
+  /** failed/cancelled 未显式给 failCode 时自动填 'TEST_FAIL'（DB CHECK 约束要求）。 */
+  readonly failCode?: string;
+  readonly generation?: number;
+  readonly createdAt?: Date;
+  readonly origin?: 'api' | 'agent' | 'sequence';
+}
+
+/** 直接插一行 outbox_messages（绕过 repo，用于构造测试前置数据）。 */
+export async function insertOutbox(
+  groupId: string,
+  accountUuid: string,
+  opts: OutboxSeedOptions = {},
+): Promise<{ id: string; clientMsgId: string }> {
+  const status = opts.status ?? 'queued';
+  const failCode =
+    opts.failCode ?? (status === 'failed' || status === 'cancelled' ? 'TEST_FAIL' : null);
+  const clientMsgId = randomUUID();
+  const { rows } = await pool.query<{ id: string }>(
+    `INSERT INTO outbox_messages
+       (group_id, account_id, client_msg_id, text, delivery_status, fail_code, origin, generation, created_at)
+     VALUES ($1, $2, $3, 'test message', $4, $5, $6, $7, COALESCE($8::timestamptz, now()))
+     RETURNING id`,
+    [
+      groupId,
+      accountUuid,
+      clientMsgId,
+      status,
+      failCode,
+      opts.origin ?? 'api',
+      opts.generation ?? 0,
+      opts.createdAt ?? null,
+    ],
+  );
+  const id = rows[0]?.id;
+  if (id === undefined) throw new Error('插入 outbox 失败');
+  return { id, clientMsgId };
 }
