@@ -33,6 +33,10 @@ export const ErrorCode = {
 
   // 建群（切片 4）
   ACCOUNT_NOT_ONLINE: 'ACCOUNT_NOT_ONLINE',
+
+  // 定时序列（切片 5）
+  SEQUENCE_ALREADY_RUNNING: 'SEQUENCE_ALREADY_RUNNING',
+  UNRESOLVED_PLACEHOLDER: 'UNRESOLVED_PLACEHOLDER',
 } as const;
 
 export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode];

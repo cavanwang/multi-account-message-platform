@@ -11,6 +11,8 @@
  * （重复事件不影响最终状态）。
  */
 import { OutboxRepo } from '../../repos/outbox.js';
+import { SequenceRepo } from '../../repos/sequences.js';
+import { scheduleNextStep } from '../sequence-runner.js';
 import { upsertMessage } from '../../repos/messages.js';
 import { enqueueWebEvent } from '../../repos/web-events.js';
 import type { HandlerContext } from './types.js';
@@ -86,4 +88,27 @@ export async function handleMessageSent(ctx: HandlerContext, payload: unknown): 
     text: outbox.text,
     sentAt,
   });
+
+  // 推进定时序列步骤：若此 outbox 属于某个 sequence step，标记 sent 并排下一步
+  if (outbox.origin === 'sequence') {
+    const sequenceRepo = new SequenceRepo(ctx.pool);
+    const step = await sequenceRepo.findStepByOutboxId(ctx.client, outbox.id);
+    if (step !== undefined && step.status === 'accepted') {
+      await sequenceRepo.markStepSent(ctx.client, step.runId, step.stepIndex, sentAt);
+      const run = await sequenceRepo.getRun(ctx.client, step.runId);
+      if (run !== undefined) {
+        const sequence = await sequenceRepo.getSequence(ctx.client, run.sequenceId);
+        if (sequence !== undefined) {
+          await scheduleNextStep(
+            sequenceRepo,
+            ctx.client,
+            step.runId,
+            sequence.steps,
+            step.stepIndex,
+            sentAt,
+          );
+        }
+      }
+    }
+  }
 }

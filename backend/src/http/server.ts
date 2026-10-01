@@ -16,6 +16,7 @@ import { registerAccountRoutes } from './routes/accounts.js';
 import { registerGroupRoutes } from './routes/groups.js';
 import { registerJobRoutes } from './routes/jobs.js';
 import { registerAgentRunRoutes } from './routes/agent-runs.js';
+import { registerSequenceRoutes } from './routes/sequences.js';
 import { registerWsRoutes } from './routes/ws.js';
 import { WsHub } from '../services/ws-hub.js';
 
@@ -129,6 +130,9 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
 
     // 切片 5：Agent Run 查询路由
     await registerAgentRunRoutes(protectedScope, pool);
+
+    // 切片 5：定时序列路由
+    await registerSequenceRoutes(protectedScope, { pool });
   });
 
   return app;

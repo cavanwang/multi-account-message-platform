@@ -27,6 +27,8 @@ import { GroupRepo } from './repos/groups.js';
 import { OutboxRepo } from './repos/outbox.js';
 import { AccountRepo } from './repos/accounts.js';
 import { AgentRunnerWorker } from './workers/agent-runner-worker.js';
+import { SequenceRunnerWorker } from './workers/sequence-runner-worker.js';
+import { SequenceRepo } from './repos/sequences.js';
 
 async function main(): Promise<void> {
   let config: AppConfig;
@@ -139,6 +141,17 @@ async function main(): Promise<void> {
   );
   agentRunnerWorker.start();
 
+  // 后台 worker：定时序列执行器（轮询到期步骤入队 + accepted 状态检查）
+  const sequenceRunnerWorker = new SequenceRunnerWorker({
+    pool,
+    sequenceRepo: new SequenceRepo(pool),
+    groupRepo: new GroupRepo(pool),
+    accountRepo: new AccountRepo(pool),
+    outboxRepo: new OutboxRepo(pool),
+    log: app.log.child({ worker: 'sequence-runner' }),
+  }, 500);
+  sequenceRunnerWorker.start();
+
   // --- 优雅退出 ---
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -153,6 +166,7 @@ async function main(): Promise<void> {
       groupJobWorker.stop();
       wsPublisher.stop();
       agentRunnerWorker.stop();
+      sequenceRunnerWorker.stop();
       await app.close();
       await closePool();
       process.exit(0);
