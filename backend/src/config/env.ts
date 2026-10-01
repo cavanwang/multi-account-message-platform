@@ -32,6 +32,17 @@ export interface AppConfig {
   readonly mediaRetentionDays: number;
   /** C1 媒体：清理扫描周期（秒），默认 3600。 */
   readonly mediaCleanIntervalSeconds: number;
+  /**
+   * C2 Agent 提供方（选做，5.26）：
+   *   mock（默认，走 agent-mock，离线可用）| anthropic（Messages API）| openai（Chat Completions）。
+   */
+  readonly agentProvider: 'mock' | 'anthropic' | 'openai';
+  /** C2：真实 LLM 的 API key；provider=mock 时为 null。 */
+  readonly agentApiKey: string | null;
+  /** C2：模型名（未配置时按提供方取默认）。 */
+  readonly agentModel: string;
+  /** C2：API 根地址（未配置时按提供方取官方地址）。 */
+  readonly agentBaseUrl: string;
 }
 
 const LOG_LEVELS = ['fatal', 'error', 'warn', 'info', 'debug', 'trace'] as const;
@@ -87,6 +98,41 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     : '/app/media';
   const mediaRetentionDays = optionalInt('MEDIA_RETENTION_DAYS', 30, 1, 3650);
   const mediaCleanIntervalSeconds = optionalInt('MEDIA_CLEAN_INTERVAL_SECONDS', 3600, 10, 86_400);
+
+  // ---- C2 真实 LLM 配置（默认 mock，不配 key 也能正常启动） ----
+  const AGENT_PROVIDERS = ['mock', 'anthropic', 'openai'] as const;
+  const providerRaw = source['AGENT_PROVIDER'];
+  let agentProvider: (typeof AGENT_PROVIDERS)[number] = 'mock';
+  if (providerRaw !== undefined && providerRaw.trim() !== '') {
+    if ((AGENT_PROVIDERS as readonly string[]).includes(providerRaw.trim())) {
+      agentProvider = providerRaw.trim() as (typeof AGENT_PROVIDERS)[number];
+    } else {
+      problems.push(`AGENT_PROVIDER 必须是 ${AGENT_PROVIDERS.join(' | ')} 之一，当前为 "${providerRaw}"`);
+    }
+  }
+  // 提供方默认地址与模型：未显式配置时使用官方默认，接入时最少只需配 key
+  const PROVIDER_DEFAULTS = {
+    anthropic: { baseUrl: 'https://api.anthropic.com', model: 'claude-3-5-haiku-20241022' },
+    openai: { baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+  } as const;
+  const apiKeyRaw = source['AGENT_API_KEY'];
+  const agentApiKey = apiKeyRaw !== undefined && apiKeyRaw.trim() !== '' ? apiKeyRaw.trim() : null;
+  const baseUrlRaw = source['AGENT_BASE_URL'];
+  const modelRaw = source['AGENT_MODEL'];
+  const agentBaseUrl = agentProvider === 'mock'
+    ? ''
+    : baseUrlRaw !== undefined && baseUrlRaw.trim() !== ''
+      ? baseUrlRaw.trim().replace(/\/+$/, '')
+      : PROVIDER_DEFAULTS[agentProvider].baseUrl;
+  const agentModel = agentProvider === 'mock'
+    ? ''
+    : modelRaw !== undefined && modelRaw.trim() !== ''
+      ? modelRaw.trim()
+      : PROVIDER_DEFAULTS[agentProvider].model;
+  // 选了真实提供方就必须给 key（启动即失败，而不是第一次 turn 才报错）
+  if (agentProvider !== 'mock' && agentApiKey === null) {
+    problems.push(`AGENT_PROVIDER=${agentProvider} 时必须设置 AGENT_API_KEY`);
+  }
 
   const databaseUrl = required('DATABASE_URL');
   const gatewayUrl = required('GATEWAY_URL');
@@ -145,5 +191,9 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     mediaDir,
     mediaRetentionDays,
     mediaCleanIntervalSeconds,
+    agentProvider,
+    agentApiKey,
+    agentModel,
+    agentBaseUrl,
   };
 }

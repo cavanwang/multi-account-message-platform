@@ -237,6 +237,24 @@ docker compose exec db psql -U app -d app -c \
 重复事件到达时可重新下载。相关环境变量：`MEDIA_DIR` / `MEDIA_RETENTION_DAYS` /
 `MEDIA_CLEAN_INTERVAL_SECONDS`（见 `.env.example`）。
 
+### 8. 真实 LLM 接入（C2 选做）
+
+默认 agent run 由 agent-mock 驱动（离线、S1–S8 可重复）。配置提供方后可改由真实大模型驱动，
+runner 的工具协议、审计累计、预算与崩溃恢复逻辑对两者完全相同：
+
+```bash
+# docker-compose.yml backend.environment 增加（或宿主机本地开发时写入 backend/.env）：
+AGENT_PROVIDER: openai            # 或 anthropic
+AGENT_API_KEY: sk-...             # 必填，缺失则启动即失败
+# AGENT_MODEL / AGENT_BASE_URL 留空即取官方默认，也可指向任意 OpenAI 兼容网关
+```
+
+- anthropic：Messages API，内容块协议与本项目同源、直通；
+- openai：Chat Completions，自动完成「工具定义 / tool_calls / role:tool」双向转换；
+- 审计（callAudit）由同一模型配合强约束 JSON prompt 充当审计员。
+
+注意：真实模型行为不确定，S1–S8 脚本断言基于 mock，请在验证脚本场景时保持 `AGENT_PROVIDER=mock`。
+
 ## 一键脚本验证（题面场景 S1–S8）
 
 题面 `docs/examination_project.md` §2.4 的 8 个场景已全部脚本化，宿主机执行、只调容器 HTTP，
@@ -254,6 +272,7 @@ docker compose exec db psql -U app -d app -c \
 ./scripts/test-group-job.sh       # 建群 job 全流程 + JOIN_TIMEOUT
 ./scripts/test-event-recovery.sh  # 停机恢复 INV-4（断流补齐）
 ./scripts/test-ws-reconnect.sh    # WebSocket 断线重连 + sinceSeq 补发
+./scripts/test-playwright.sh      # C3：Playwright UI 自动化（首次自动下载 chromium）
 ```
 
 ---
@@ -294,10 +313,21 @@ cd backend
 npm test
 ```
 
-当前共 230 个用例（22 个测试文件）。覆盖范围：账号状态机 6×6 转移表全枚举、
+当前共 244 个用例（23 个测试文件）。覆盖范围：账号状态机 6×6 转移表全枚举、
 CAS 乐观锁并发、终态原子事务、限流到期自动恢复、出站投递与 504 收敛、
 事件消费乱序/重复、建群 job、Agent 运行（审计/幂等/崩溃恢复/预算/取消/续跑 stepNo）、
-定时序列（占位符/黏性变量/账号选择/并发冲突）、C1 媒体（下载幂等/到期清理/run 保护）。
+定时序列（占位符/黏性变量/账号选择/并发冲突）、C1 媒体（下载幂等/到期清理/run 保护）、
+C2 真实 LLM 适配器（请求转换/审计 JSON 解析，mock fetch 验证，无需 key）。
+
+### Playwright UI 测试（C3 选做）
+
+界面层端到端（登录/权限渲染、viewer 无写按钮且接口 403、状态按钮按 FSM 显隐、退出与路由守卫）：
+
+```bash
+docker compose up -d           # 前端 5173 / 后端 3000 就绪
+./scripts/test-playwright.sh   # 首次自动 npm install + 下载 chromium（约 120MB）
+# 浏览器启动报缺共享库时：cd frontend && sudo npx playwright install-deps chromium
+```
 
 ## 数据库迁移约定
 
@@ -344,10 +374,13 @@ scripts/                 集成测试脚本
 - [x] **B4 前端页面 4–5**：agent run 步骤详情、序列运行与预检；WebSocket 断线补齐验证
 - [x] **题面 S1–S8 场景脚本化**：两个 e2e 脚本一键复现（5.23），各两轮验证通过
 - [x] **C1 媒体文件（选做，5.25）**：mediaUrl 下载到本地 / 到期清理 / 运行中 run 保护
+- [x] **C2 真实 LLM 接入（选做，5.26）**：Anthropic/OpenAI 双协议适配器 + 审计 LLM 化，默认仍走 mock
+- [x] **C3 Playwright 自动化（选做，5.26）**：6 个 UI e2e 用例，两轮验证通过
 
 ## 已知限制
 
 - 网关/Agent 模拟器的内部状态保存在内存中，**进程重启即清空**（题目未要求持久化）。
 - 当前 `JWT_SECRET` 为演示用固定值，生产环境应通过 secret 注入。
-- C 组选做项 C2（真实 LLM 接入）、C3（Playwright 自动化）未实现。
-  C2 不建议启用：需要外网与付费 API key，且真实模型行为不可预测，会破坏 S1–S8 脚本的确定性。
+- C2 真实 LLM 已具备接入能力但默认不启用：需要外网与付费 API key，
+  且真实模型行为不可预测，验证 S1–S8 脚本时应保持 mock。
+- Playwright 浏览器二进制不随仓库/镜像分发，首次运行脚本时自动下载到宿主机。

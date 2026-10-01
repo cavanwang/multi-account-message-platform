@@ -2,3 +2,7 @@
 node_modules/
 dist/
 *.log
+
+# Playwright（C3）：运行产物
+test-results/
+playwright-report/

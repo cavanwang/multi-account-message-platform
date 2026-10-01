@@ -22,7 +22,7 @@ import { GroupJobWorker } from './workers/group-job.js';
 import { LeaveAllJobWorker } from './workers/leave-all-job.js';
 import { WsHub } from './services/ws-hub.js';
 import { WsPublisher } from './workers/ws-publisher.js';
-import { AgentClient } from './services/agent-client.js';
+import { createAgentClient } from './services/llm-clients.js';
 import { AgentRunRepo } from './repos/agent-runs.js';
 import { GroupRepo } from './repos/groups.js';
 import { OutboxRepo } from './repos/outbox.js';
@@ -143,9 +143,9 @@ async function main(): Promise<void> {
   const wsPublisher = new WsPublisher(pool, wsHub, { intervalMs: 500, batchSize: 100 });
   await wsPublisher.start();
 
-  // 后台 worker：Agent Run 执行器（轮询 running runs → runAgent）
-  const agentClient = new AgentClient(
-    config.agentUrl,
+  // Agent 客户端：按 AGENT_PROVIDER 选择 agent-mock（默认，离线）或真实 LLM（C2 选做）
+  const agentClient = createAgentClient(
+    config,
     app.log.child({ component: 'agent-client' }),
   );
   const agentRunnerWorker = new AgentRunnerWorker(
