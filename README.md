@@ -52,7 +52,7 @@ docker compose down -v
 
 ```bash
 curl http://localhost:3000/api/health
-# 期望：{"ok":true,"schemaVersion":9,...}
+# 期望：{"ok":true,"schemaVersion":12}
 ```
 
 ### 1. 登录与权限
@@ -124,9 +124,10 @@ GROUP_UUID=$(curl -s http://localhost:3000/api/groups -H "Authorization: Bearer 
 curl http://localhost:3000/api/groups/$GROUP_UUID -H "Authorization: Bearer $TOKEN"
 
 # 发送消息到群（入 outbox，OutboxSender 异步投递）
+# accountId 为必填：指定用哪个服务账号的身份发送
 curl -X POST http://localhost:3000/api/groups/$GROUP_UUID/send \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"text":"hello world"}'
+  -d '{"accountId":"acct-1","text":"hello world"}'
 
 # 消息时间线（游标分页）
 curl "http://localhost:3000/api/groups/$GROUP_UUID/messages?limit=20" \
@@ -174,7 +175,9 @@ curl http://localhost:3000/api/agent-runs/$RUN_ID -H "Authorization: Bearer $TOK
 **Agent 行为控制**（通过 agent-mock 的 `/_mock` 接口）：
 
 ```bash
-# 切换 turn 行为：normal | never_finish | repeat_get | bad_json | duplicate_tool_use | timeout
+# 切换 turn 行为：
+#   normal | bad_json | unknown_tool | invalid_input | duplicate_id |
+#   retry_same_key | never_finish | repeat_get | slow | hang
 curl -X POST http://localhost:3200/_mock/behavior \
   -H 'Content-Type: application/json' -d '{"mode":"normal"}'
 
@@ -198,19 +201,34 @@ curl -X POST http://localhost:3100/_mock/messages/inject \
   -H 'Content-Type: application/json' \
   -d '[{"groupId":"<gatewayGroupId>","senderPlatformUserId":"u1","text":"hi","sentAt":"2026-01-01T00:00:01.000Z"}]'
 
-# 事件重播 / 乱序 / 去重模式
+# 事件重播 / 乱序 / 去重模式（开关参数名为 on）
 curl -X POST http://localhost:3100/_mock/events/replay -H 'Content-Type: application/json' -d '{"count":5}'
-curl -X POST http://localhost:3100/_mock/events/shuffle-mode -H 'Content-Type: application/json' -d '{"enabled":true}'
-curl -X POST http://localhost:3100/_mock/events/duplicate-mode -H 'Content-Type: application/json' -d '{"enabled":true}'
+curl -X POST http://localhost:3100/_mock/events/shuffle-mode -H 'Content-Type: application/json' -d '{"on":true}'
+curl -X POST http://localhost:3100/_mock/events/duplicate-mode -H 'Content-Type: application/json' -d '{"on":true}'
 
-# 一次性 504（下次 kick 返回 NETWORK_TIMEOUT）
-curl -X POST http://localhost:3100/_mock/faults -H 'Content-Type: application/json' -d '{"kickTimeoutOnce":true}'
+# 故障注入：send 端点 504 一次、1500ms 后落地（题面 S5）
+curl -X POST http://localhost:3100/_mock/faults -H 'Content-Type: application/json' \
+  -d '{"endpoint":"send","mode":"504","count":1,"landAfterMs":1500}'
+# 也支持 mode:"503"/"delay"；{"clearAll":true} 清除所有已注册故障
 ```
 
-集成测试脚本（验证停机恢复 INV-4）：
+## 一键脚本验证（题面场景 S1–S8）
+
+题面 `docs/examination_project.md` §2.4 的 8 个场景已全部脚本化，宿主机执行、只调容器 HTTP，
+正常约 1 分钟跑完，结尾打印 `PASS`：
 
 ```bash
-./scripts/test-event-recovery.sh
+./scripts/test-e2e-s1-s5.sh   # S1 时序 / S2 事件重复 / S3 自身回流 / S4 限流 / S5 504 收敛 + agent 重试
+./scripts/test-e2e-s6-s8.sh   # S6 Agent 坏响应 / S7 序列并发 201+409 / S8 占位符预检 422
+```
+
+其余集成脚本：
+
+```bash
+./scripts/test-gateway-mock.sh    # 网关模拟器契约 + 故障注入自测
+./scripts/test-group-job.sh       # 建群 job 全流程 + JOIN_TIMEOUT
+./scripts/test-event-recovery.sh  # 停机恢复 INV-4（断流补齐）
+./scripts/test-ws-reconnect.sh    # WebSocket 断线重连 + sinceSeq 补发
 ```
 
 ---
@@ -251,8 +269,10 @@ cd backend
 npm test
 ```
 
-覆盖范围：账号状态机 6×6 转移表全枚举、CAS 乐观锁并发、终态原子事务、限流到期自动恢复、
-出站投递与 504 收敛、事件消费乱序/重复、建群 job、Agent 运行（审计/幂等/崩溃恢复/预算/取消）。
+当前共 222 个用例（21 个测试文件）。覆盖范围：账号状态机 6×6 转移表全枚举、
+CAS 乐观锁并发、终态原子事务、限流到期自动恢复、出站投递与 504 收敛、
+事件消费乱序/重复、建群 job、Agent 运行（审计/幂等/崩溃恢复/预算/取消/续跑 stepNo）、
+定时序列（占位符/黏性变量/账号选择/并发冲突）。
 
 ## 数据库迁移约定
 
@@ -291,15 +311,16 @@ scripts/                 集成测试脚本
 - [x] **切片 2 账号状态机**：6×6 转移表 / CAS 乐观锁 / 终态原子后果 / 限流自动恢复
 - [x] **切片 3 出站投递 + 网关事件消费**：outbox 可靠投递 / 504 收敛 / 事件幂等与乱序
 - [x] **切片 4 建群 / 时间线分页 / WebSocket**：异步建群 job / 游标分页 / sinceSeq 补发
-- [x] **切片 5 Agent（部分）**：Agent 模拟器 + 运行主循环 + 审计 + kick_user + 幂等键 + 崩溃恢复 + 大小限制 + 取消
+- [x] **切片 5 Agent**：Agent 模拟器 + 运行主循环 + 审计 + kick_user + 幂等键 + 崩溃恢复 + 大小限制 + 取消
 - [x] **切片 5 定时序列执行（B1）**：模板/运行/步骤执行/变量占位符/账号选择
 - [x] **切片 5 全量退群（B2）**：非群主先退、群主最后退、失败记 errors[]
 - [x] **切片 5 登录会话（B3）**：refresh token 轮换、复用作废、logout 立即失效；前端自动续期 + single-flight
 - [x] **A6 前端页面 1–3**：登录 / 账号列表 / 群详情（React 18 + Vite）
-- [ ] B4 前端页面 4–5（agent run 详情、序列运行）与断线补齐验证
+- [x] **B4 前端页面 4–5**：agent run 步骤详情、序列运行与预检；WebSocket 断线补齐验证
+- [x] **题面 S1–S8 场景脚本化**：两个 e2e 脚本一键复现（5.23），各两轮验证通过
 
 ## 已知限制
 
 - 网关/Agent 模拟器的内部状态保存在内存中，**进程重启即清空**（题目未要求持久化）。
 - 当前 `JWT_SECRET` 为演示用固定值，生产环境应通过 secret 注入。
-- 前端页面 4–5（agent run 详情、序列运行）属于 B4，尚未实现。
+- C 组选做项（C1 媒体文件、C2 真实 LLM、C3 Playwright）未实现。
