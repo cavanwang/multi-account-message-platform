@@ -80,6 +80,22 @@ npm run dev                  # 启动后端（热重载）
 | `npm run seed:hash -- <pw>` | 生成 bcrypt 哈希，用于 seed 迁移 |
 | `npm test` | 运行单元测试（vitest） |
 
+### 单元测试
+
+测试需要可连接的 PostgreSQL（`docker compose up -d db` 即可）。首次运行时 vitest 的
+globalSetup 会**自动创建并迁移独立的 `app_test` 数据库**，不影响 `app` 库；每个用例开始前自动重置数据。
+可用 `TEST_DATABASE_URL` / `TEST_ADMIN_DATABASE_URL` 环境变量覆盖默认连接串
+（默认 `postgres://app:app@localhost:5432/app_test`）。
+
+```bash
+docker compose up -d db
+cd backend
+npm test
+```
+
+覆盖范围：账号状态机 6×6 转移表全枚举、CAS 乐观锁并发、终态原子事务（含失败回滚与四来源一致性）、
+限流到期自动恢复 worker。
+
 ## 数据库迁移约定
 
 - 迁移文件位于 `backend/migrations/`，命名 `NNNN_<name>.sql`（4 位序号）。
