@@ -17,7 +17,8 @@ import { RateLimitSweeper } from './workers/rate-limit-sweeper.js';
 import { OutboxSender } from './workers/outbox-sender.js';
 import { Reconcile504Worker } from './workers/reconcile-504.js';
 import { EventConsumer } from './workers/event-consumer.js';
-import { HttpSendGateway, HttpQueryGateway } from './services/gateway-client.js';
+import { HttpSendGateway, HttpQueryGateway, HttpGroupGateway } from './services/gateway-client.js';
+import { GroupJobWorker } from './workers/group-job.js';
 
 async function main(): Promise<void> {
   let config: AppConfig;
@@ -90,6 +91,19 @@ async function main(): Promise<void> {
   );
   eventConsumer.start();
 
+  // 后台 worker：建群 job 执行器（create → invite → join → promote）
+  const groupGateway = new HttpGroupGateway(
+    config.gatewayUrl,
+    app.log.child({ component: 'gateway-group' }),
+  );
+  const groupJobWorker = new GroupJobWorker(
+    pool,
+    groupGateway,
+    app.log.child({ worker: 'group-job' }),
+    1000,
+  );
+  groupJobWorker.start();
+
   // --- 优雅退出 ---
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -101,6 +115,7 @@ async function main(): Promise<void> {
       outboxSender.stop();
       reconcileWorker.stop();
       eventConsumer.stop();
+      groupJobWorker.stop();
       await app.close();
       await closePool();
       process.exit(0);

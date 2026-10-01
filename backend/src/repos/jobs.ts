@@ -9,7 +9,7 @@
  *      joined_at          收到 member_joined 的时刻
  *      promote_calls      promote 调用次数（硬上限 2）
  *
- * 本批次（4.1/4.2/4.7）只实现"创建 + 查询"；worker 推进方法随批次 2（任务 4.3-4.6）补充。
+ * 本批次（4.1/4.2/4.7）实现"创建 + 查询"；批次 2（4.3-4.6）补充 worker 推进方法。
  */
 import type { Pool, PoolClient } from 'pg';
 
@@ -32,6 +32,14 @@ export interface JobRow {
   readonly updatedAt: Date;
 }
 
+export interface JobMemberRow {
+  readonly jobId: string;
+  readonly accountId: string;
+  readonly joinRequestedAt: Date | null;
+  readonly joinedAt: Date | null;
+  readonly promoteCalls: number;
+}
+
 interface DbJobRow {
   id: string;
   kind: JobKind;
@@ -40,6 +48,14 @@ interface DbJobRow {
   errors: JobError[];
   created_at: Date;
   updated_at: Date;
+}
+
+interface DbJobMemberRow {
+  job_id: string;
+  account_id: string;
+  join_requested_at: Date | null;
+  joined_at: Date | null;
+  promote_calls: number;
 }
 
 function fromDb(row: DbJobRow): JobRow {
@@ -51,6 +67,16 @@ function fromDb(row: DbJobRow): JobRow {
     errors: row.errors,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function fromDbMember(row: DbJobMemberRow): JobMemberRow {
+  return {
+    jobId: row.job_id,
+    accountId: row.account_id,
+    joinRequestedAt: row.join_requested_at,
+    joinedAt: row.joined_at,
+    promoteCalls: row.promote_calls,
   };
 }
 
@@ -100,5 +126,100 @@ export class JobRepo {
       [jobId],
     );
     return rows[0] !== undefined ? fromDb(rows[0]) : undefined;
+  }
+
+  // -------------------------------------------------------------------------
+  // 批次 2：worker 推进方法（4.3-4.6）
+  // -------------------------------------------------------------------------
+
+  /** 取一个可执行的 create_group job（单条；多实例场景由 advisory lock 兜底）。 */
+  async listRunnableCreateGroupJobs(limit = 10): Promise<JobRow[]> {
+    const { rows } = await this.pool.query<DbJobRow>(
+      `SELECT * FROM jobs
+       WHERE kind = 'create_group' AND status = 'running'
+       ORDER BY created_at ASC
+       LIMIT $1`,
+      [limit],
+    );
+    return rows.map(fromDb);
+  }
+
+  /** 查询 job 的成员进度（含 join_requested_at / joined_at / promote_calls）。 */
+  async listJobMembers(jobId: string): Promise<JobMemberRow[]> {
+    const { rows } = await this.pool.query<DbJobMemberRow>(
+      `SELECT * FROM group_job_members WHERE job_id = $1 ORDER BY account_id`,
+      [jobId],
+    );
+    return rows.map(fromDbMember);
+  }
+
+  /** 标记某成员已发出 join 请求（JOIN_TIMEOUT 判定基准）。 */
+  async markJoinRequested(client: PoolClient, jobId: string, accountId: string): Promise<void> {
+    await client.query(
+      `UPDATE group_job_members
+       SET join_requested_at = now()
+       WHERE job_id = $1 AND account_id = $2`,
+      [jobId, accountId],
+    );
+  }
+
+  /** 标记某成员已入群（member_joined 到达时调用）。 */
+  async markJoined(client: PoolClient, jobId: string, accountId: string): Promise<void> {
+    await client.query(
+      `UPDATE group_job_members
+       SET joined_at = now()
+       WHERE job_id = $1 AND account_id = $2`,
+      [jobId, accountId],
+    );
+  }
+
+  /** promote 调用次数 +1，返回新计数。 */
+  async incrementPromoteCalls(client: PoolClient, jobId: string, accountId: string): Promise<number> {
+    const { rows } = await client.query<{ promote_calls: number }>(
+      `UPDATE group_job_members
+       SET promote_calls = promote_calls + 1
+       WHERE job_id = $1 AND account_id = $2
+       RETURNING promote_calls`,
+      [jobId, accountId],
+    );
+    return rows[0]?.promote_calls ?? 0;
+  }
+
+  /** 追加 error 并把 job 置为 failed。 */
+  async appendErrorAndFail(client: PoolClient, jobId: string, err: JobError): Promise<void> {
+    await client.query(
+      `UPDATE jobs
+       SET errors = errors || $1::jsonb, status = 'failed', updated_at = now()
+       WHERE id = $2`,
+      [JSON.stringify(err), jobId],
+    );
+  }
+
+  /** 把 job 置为 finished。 */
+  async markFinished(client: PoolClient, jobId: string): Promise<void> {
+    await client.query(
+      `UPDATE jobs SET status = 'finished', updated_at = now() WHERE id = $1`,
+      [jobId],
+    );
+  }
+
+  /** 把邀请链接写入 payload（invite 步骤成功后持久化，重启恢复用）。 */
+  async updateInvitePayload(client: PoolClient, jobId: string, invite: { inviteLink: string; inviteReadyAt: Date }): Promise<void> {
+    await client.query(
+      `UPDATE jobs
+       SET payload = payload || $1::jsonb, updated_at = now()
+       WHERE id = $2`,
+      [JSON.stringify(invite), jobId],
+    );
+  }
+
+  /** 清除 payload 中的邀请信息（INVITE_EXPIRED 后重新申请）。 */
+  async clearInvitePayload(client: PoolClient, jobId: string): Promise<void> {
+    await client.query(
+      `UPDATE jobs
+       SET payload = payload - 'inviteLink' - 'inviteReadyAt', updated_at = now()
+       WHERE id = $1`,
+      [jobId],
+    );
   }
 }

@@ -20,6 +20,8 @@ export interface GroupRow {
   readonly version: number;
   readonly createdAt: Date;
   readonly updatedAt: Date;
+  /** 关联的建群 job id（未关联为 null）。 */
+  readonly createdByJobId: string | null;
 }
 
 export interface GroupMemberRow {
@@ -40,6 +42,7 @@ interface DbGroupRow {
   version: number;
   created_at: Date;
   updated_at: Date;
+  created_by_job_id: string | null;
 }
 
 interface DbGroupMemberRow {
@@ -61,6 +64,7 @@ function fromDbGroup(row: DbGroupRow): GroupRow {
     version: row.version,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    createdByJobId: row.created_by_job_id,
   };
 }
 
@@ -201,5 +205,53 @@ export class GroupRepo {
       [accountId],
     );
     return rows.map(fromDbMember);
+  }
+
+  // -------------------------------------------------------------------------
+  // 批次 2：建群 job 专用（4.3-4.6）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 按 job id 查群（create 步骤幂等校验：已建群则跳过）。
+   */
+  async findByJobId(jobId: string, client?: PoolClient): Promise<GroupRow | undefined> {
+    const executor = client ?? this.pool;
+    const { rows } = await executor.query<DbGroupRow>(
+      'SELECT * FROM groups WHERE created_by_job_id = $1',
+      [jobId],
+    );
+    return rows[0] !== undefined ? fromDbGroup(rows[0]) : undefined;
+  }
+
+  /**
+   * 建群成功后写 groups 行 + 创建者成员行（role='creator'）。
+   * 必须在调用方事务内调用（与 gateway createGroup 写 DB 原子生效）。
+   */
+  async insertGroup(
+    client: PoolClient,
+    params: {
+      gatewayGroupId: string;
+      creatorAccountId: string;
+      creatorPlatformUserId: string;
+      jobId: string;
+    },
+  ): Promise<string> {
+    const { rows } = await client.query<{ id: string }>(
+      `INSERT INTO groups
+         (gateway_group_id, creator_account_id, agent_enabled, auto_kick_enabled, version, created_by_job_id)
+       VALUES ($1, $2, false, false, 1, $3)
+       RETURNING id`,
+      [params.gatewayGroupId, params.creatorAccountId, params.jobId],
+    );
+    const groupId = rows[0]?.id;
+    if (groupId === undefined) throw new Error('insertGroup 失败');
+
+    await client.query(
+      `INSERT INTO group_members (group_id, account_id, platform_user_id, role, joined_at)
+       VALUES ($1, $2, $3, 'creator', now())
+       ON CONFLICT (group_id, account_id) DO NOTHING`,
+      [groupId, params.creatorAccountId, params.creatorPlatformUserId],
+    );
+    return groupId;
   }
 }

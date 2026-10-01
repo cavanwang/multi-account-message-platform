@@ -3,15 +3,17 @@
  *
  *  - HttpAccountGateway：connect / disconnect（账号路由与 AccountService 使用）
  *  - HttpSendGateway：POST /groups/:groupId/send（outbox-sender worker 使用）
+ *  - HttpQueryGateway：by-client-id 查询（504 收敛 worker 使用）
+ *  - HttpGroupGateway：createGroup / createInvite / join / promote（建群 job worker 使用）
  *
  * 设计原则：
- *  - 接口层（SendGateway）与 HTTP 实现分离，测试时可注入假网关；
- *  - send 的所有响应（成功/业务错误/网络异常）都收敛到类型安全的 SendResult；
+ *  - 接口层（SendGateway / QueryGateway / GroupGateway）与 HTTP 实现分离，
+ *    测试时可注入假网关；
+ *  - 所有响应（成功/业务错误/网络异常）都收敛到类型安全的联合类型；
  *  - 网络异常（fetch 抛错）统一收敛为 503 SERVICE_UNAVAILABLE，
- *    由调用方（outbox-sender）退避重试，**不自动重发**（避免雪崩）。
+ *    由调用方决定重试策略，**不自动重发**（避免雪崩）。
  *
- * 日志：每条发送/响应都输出结构化日志，携带 { clientMsgId, groupId, accountId,
- * gatewayStatus, gatewayCode }，便于按 ID 串联排查。
+ * 日志：每次往返都输出结构化日志，携带关键 ID，便于串联排查。
  */
 import type { GatewayClient } from './accounts.js';
 
@@ -198,5 +200,184 @@ export class HttpQueryGateway implements QueryGateway {
       'gateway: by-client-id 不可用',
     );
     return { kind: 'unavailable' };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GroupGateway：建群 job 专用（createGroup / createInvite / join / promote）
+// ---------------------------------------------------------------------------
+
+/** 建群网关统一响应：成功 / 业务错误 / 网络异常。 */
+export type GroupResult<T = void> =
+  | { kind: 'ok'; data: T }
+  | { kind: 'error'; status: number; code: string }
+  | { kind: 'network'; status: number; code: string };
+
+export interface GroupGateway {
+  createGroup(creatorAccountId: string): Promise<GroupResult<{ groupId: string }>>;
+  createInvite(
+    gatewayGroupId: string,
+    options?: { readyAfterMs?: number; ttlMs?: number },
+  ): Promise<GroupResult<{ inviteLink: string; readyAfterMs: number }>>;
+  join(
+    gatewayGroupId: string,
+    accountId: string,
+    inviteLink: string,
+  ): Promise<GroupResult>;
+  promote(
+    gatewayGroupId: string,
+    byAccountId: string,
+    accountId: string,
+  ): Promise<GroupResult>;
+}
+
+/** 提取 { error: { code } } 里的 code 字段。 */
+function extractCode(body: unknown): string {
+  if (typeof body !== 'object' || body === null) return 'UNKNOWN_ERROR';
+  const err = (body as Record<string, unknown>)['error'];
+  if (typeof err !== 'object' || err === null) return 'UNKNOWN_ERROR';
+  return typeof (err as Record<string, unknown>)['code'] === 'string'
+    ? ((err as Record<string, unknown>)['code'] as string)
+    : 'UNKNOWN_ERROR';
+}
+
+/** HTTP 实现：建群相关端点。 */
+export class HttpGroupGateway implements GroupGateway {
+  constructor(
+    private readonly gatewayUrl: string,
+    private readonly log: LoggerLike,
+  ) {}
+
+  async createGroup(creatorAccountId: string): Promise<GroupResult<{ groupId: string }>> {
+    const url = `${this.gatewayUrl}/groups`;
+    const logCtx = { creatorAccountId };
+
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ creatorAccountId }),
+      });
+    } catch (netErr) {
+      this.log.warn(
+        { ...logCtx, err: netErr instanceof Error ? netErr.message : String(netErr) },
+        'gateway: createGroup 网络异常',
+      );
+      return { kind: 'network', status: 503, code: 'SERVICE_UNAVAILABLE' };
+    }
+
+    if (res.status === 200) {
+      const data = (await res.json()) as { groupId: string };
+      this.log.debug({ ...logCtx, groupId: data.groupId }, 'gateway: createGroup 成功');
+      return { kind: 'ok', data };
+    }
+
+    const code = extractCode(await res.json().catch(() => ({})));
+    this.log.warn({ ...logCtx, status: res.status, code }, 'gateway: createGroup 业务错误');
+    return { kind: 'error', status: res.status, code };
+  }
+
+  async createInvite(
+    gatewayGroupId: string,
+    options?: { readyAfterMs?: number; ttlMs?: number },
+  ): Promise<GroupResult<{ inviteLink: string; readyAfterMs: number }>> {
+    const url = `${this.gatewayUrl}/groups/${encodeURIComponent(gatewayGroupId)}/invite`;
+    const logCtx = { gatewayGroupId };
+
+    const body: Record<string, unknown> = {};
+    if (typeof options?.readyAfterMs === 'number') body['readyAfterMs'] = options.readyAfterMs;
+    if (typeof options?.ttlMs === 'number') body['ttlMs'] = options.ttlMs;
+
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch (netErr) {
+      this.log.warn(
+        { ...logCtx, err: netErr instanceof Error ? netErr.message : String(netErr) },
+        'gateway: createInvite 网络异常',
+      );
+      return { kind: 'network', status: 503, code: 'SERVICE_UNAVAILABLE' };
+    }
+
+    if (res.status === 200) {
+      const data = (await res.json()) as { inviteLink: string; readyAfterMs: number };
+      this.log.debug({ ...logCtx, inviteLink: data.inviteLink }, 'gateway: createInvite 成功');
+      return { kind: 'ok', data };
+    }
+
+    const code = extractCode(await res.json().catch(() => ({})));
+    this.log.warn({ ...logCtx, status: res.status, code }, 'gateway: createInvite 业务错误');
+    return { kind: 'error', status: res.status, code };
+  }
+
+  async join(
+    gatewayGroupId: string,
+    accountId: string,
+    inviteLink: string,
+  ): Promise<GroupResult> {
+    const url = `${this.gatewayUrl}/groups/${encodeURIComponent(gatewayGroupId)}/join`;
+    const logCtx = { gatewayGroupId, accountId };
+
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ accountId, inviteLink }),
+      });
+    } catch (netErr) {
+      this.log.warn(
+        { ...logCtx, err: netErr instanceof Error ? netErr.message : String(netErr) },
+        'gateway: join 网络异常',
+      );
+      return { kind: 'network', status: 503, code: 'SERVICE_UNAVAILABLE' };
+    }
+
+    if (res.status === 202) {
+      this.log.debug(logCtx, 'gateway: join 受理');
+      return { kind: 'ok', data: undefined };
+    }
+
+    const code = extractCode(await res.json().catch(() => ({})));
+    this.log.warn({ ...logCtx, status: res.status, code }, 'gateway: join 业务错误');
+    return { kind: 'error', status: res.status, code };
+  }
+
+  async promote(
+    gatewayGroupId: string,
+    byAccountId: string,
+    accountId: string,
+  ): Promise<GroupResult> {
+    const url = `${this.gatewayUrl}/groups/${encodeURIComponent(gatewayGroupId)}/promote`;
+    const logCtx = { gatewayGroupId, byAccountId, accountId };
+
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ byAccountId, accountId }),
+      });
+    } catch (netErr) {
+      this.log.warn(
+        { ...logCtx, err: netErr instanceof Error ? netErr.message : String(netErr) },
+        'gateway: promote 网络异常',
+      );
+      return { kind: 'network', status: 503, code: 'SERVICE_UNAVAILABLE' };
+    }
+
+    if (res.status === 200) {
+      this.log.debug(logCtx, 'gateway: promote 成功');
+      return { kind: 'ok', data: undefined };
+    }
+
+    const code = extractCode(await res.json().catch(() => ({})));
+    this.log.warn({ ...logCtx, status: res.status, code }, 'gateway: promote 业务错误');
+    return { kind: 'error', status: res.status, code };
   }
 }

@@ -56,6 +56,15 @@ export class AccountRepo {
     return rows[0] !== undefined ? fromDb(rows[0]) : undefined;
   }
 
+  /** 按内部 UUID 查账号（建群 worker：payload 存文本 id，group_members 存 UUID）。 */
+  async findByUuid(id: string): Promise<AccountRow | undefined> {
+    const { rows } = await this.pool.query<DbAccountRow>(
+      'SELECT * FROM accounts WHERE id = $1',
+      [id],
+    );
+    return rows[0] !== undefined ? fromDb(rows[0]) : undefined;
+  }
+
   /**
    * 按文本 account_id 批量查询（建群受理的成员校验，避免 N+1 往返）。
    * 返回顺序不保证与入参一致，调用方需自行按入参顺序归并。
