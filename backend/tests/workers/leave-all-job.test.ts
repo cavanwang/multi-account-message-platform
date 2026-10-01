@@ -186,10 +186,10 @@ describe('LeaveAllJobWorker', () => {
     expect(members).toHaveLength(0);
   });
 
-  it('非群主 500 失败 → errors[]，其余继续退，群主不退，job failed', async () => {
+  it('非群主持续 500：前 2 次跨 tick 重试（running/无 errors），第 3 次后 job failed', async () => {
     const gw = new FakeGroupGateway();
     gw.leaveMemberResult = { kind: 'ok', data: undefined };
-    // 让 acct-2 失败
+    // 让 acct-2 持续失败；acct-3 正常
     gw.leaveMember = async (groupId: string, accountId: string) => {
       gw.leaveMemberCalls.push({ groupId, accountId });
       if (accountId === 'acct-2') {
@@ -202,18 +202,19 @@ describe('LeaveAllJobWorker', () => {
     const jobId = await createLeaveAllJob(groupId, gatewayGroupId);
 
     const worker = makeWorker(gw, 1000);
+
+    // tick 1：acct-2 attempts=1 重试；acct-3 成功；群主等待
     await worker.runOnce();
+    // tick 2：acct-2 attempts=2 重试；群主等待
+    await worker.runOnce();
+    let job = await new JobRepo(pool).findById(jobId);
+    expect(job!.status).toBe('running');
+    expect(job!.errors).toHaveLength(0);
+    expect((job!.payload['leaveRetries'] as Record<string, number>)['acct-2']).toBe(2);
 
-    // acct-2 和 acct-3 都被处理过
-    expect(gw.leaveMemberCalls.map((c) => c.accountId)).toContain('acct-2');
-    expect(gw.leaveMemberCalls.map((c) => c.accountId)).toContain('acct-3');
-
-    // 群主不应被 leave
-    const ownerCalled = gw.leaveMemberCalls.some((c) => c.accountId === 'acct-1');
-    expect(ownerCalled).toBe(false);
-
-    const jobRepo = new JobRepo(pool);
-    const job = await jobRepo.findById(jobId);
+    // tick 3：attempts=3 重试耗尽 → errors[]，群主不退，job failed
+    await worker.runOnce();
+    job = await new JobRepo(pool).findById(jobId);
     expect(job!.status).toBe('failed');
     // 第 1 条：非群主失败原因；第 2 条：汇总失败（群主不退）
     expect(job!.errors).toHaveLength(2);
@@ -221,13 +222,37 @@ describe('LeaveAllJobWorker', () => {
     expect(job!.errors[0]!.code).toBe('INTERNAL_ERROR');
     expect(job!.errors[1]!.code).toBe('NON_OWNER_LEAVE_FAILED');
 
-    // DB 中 acct-3 已退，acct-2 和群主仍在（按 platformUserId 断言）
-    const groupRepo = new GroupRepo(pool);
-    const members = await groupRepo.listMembers(groupId);
-    const remainingPids = members.map((m) => m.platformUserId);
+    // acct-3 已退，acct-2 和群主仍在
+    const remainingPids = (await new GroupRepo(pool).listMembers(groupId)).map((m) => m.platformUserId);
     expect(remainingPids).toContain('pu_acct-1');
     expect(remainingPids).toContain('pu_acct-2');
     expect(remainingPids).not.toContain('pu_acct-3');
+  });
+
+  it('非群主前两次 500、第三次成功 → 重试后 finished，无 errors', async () => {
+    const gw = new FakeGroupGateway();
+    // acct-2：失败 2 次后成功
+    let acct2Fails = 0;
+    gw.leaveMember = async (groupId: string, accountId: string) => {
+      gw.leaveMemberCalls.push({ groupId, accountId });
+      if (accountId === 'acct-2') {
+        acct2Fails++;
+        if (acct2Fails <= 2) return { kind: 'error', status: 500, code: 'INTERNAL_ERROR' };
+      }
+      return { kind: 'ok', data: undefined };
+    };
+
+    const { groupId, gatewayGroupId } = await seedGroupWithMembers('acct-1', ['acct-2']);
+    const jobId = await createLeaveAllJob(groupId, gatewayGroupId);
+
+    const worker = makeWorker(gw, 1000);
+    await worker.runOnce(); // 500 attempts=1
+    await worker.runOnce(); // 500 attempts=2
+    await worker.runOnce(); // 成功 → 群主退 → finished
+
+    const job = await new JobRepo(pool).findById(jobId);
+    expect(job!.status).toBe('finished');
+    expect(job!.errors).toHaveLength(0);
   });
 
   it('403 SENDER_NOT_IN_GROUP → 视为已退，直接删行继续', async () => {
@@ -280,10 +305,10 @@ describe('LeaveAllJobWorker', () => {
     expect(job!.status).toBe('finished');
   });
 
-  it('群主退群失败 → job failed', async () => {
+  it('群主持续 500：前 2 次跨 tick 重试，第 3 次后 job failed', async () => {
     const gw = new FakeGroupGateway();
     gw.leaveMemberResult = { kind: 'ok', data: undefined };
-    // 让群主失败
+    // 让群主持续失败
     gw.leaveMember = async (groupId: string, accountId: string) => {
       gw.leaveMemberCalls.push({ groupId, accountId });
       if (accountId === 'acct-1') {
@@ -296,11 +321,18 @@ describe('LeaveAllJobWorker', () => {
     const jobId = await createLeaveAllJob(groupId, gatewayGroupId);
 
     const worker = makeWorker(gw, 1000);
-    await worker.runOnce(); // 非群主退
-    await worker.runOnce(); // 群主退（失败）
+    // 非群主在同 tick 退成功，群主 500 attempts=1
+    await worker.runOnce();
+    // attempts=2，仍 running
+    await worker.runOnce();
+    let job = await new JobRepo(pool).findById(jobId);
+    expect(job!.status).toBe('running');
+    expect(job!.errors).toHaveLength(0);
+    expect((job!.payload['leaveRetries'] as Record<string, number>)['acct-1']).toBe(2);
 
-    const jobRepo = new JobRepo(pool);
-    const job = await jobRepo.findById(jobId);
+    // attempts=3 耗尽 → failed
+    await worker.runOnce();
+    job = await new JobRepo(pool).findById(jobId);
     expect(job!.status).toBe('failed');
     expect(job!.errors).toHaveLength(1);
     expect(job!.errors[0]!.step).toBe('leave:owner');

@@ -84,35 +84,42 @@ curl -X POST http://localhost:3000/api/accounts/acct-1/transition \
 预置 4 个账号 `acct-1` … `acct-4`，初始 `idle`。状态转移需带 `expectedFrom` 做 CAS 乐观锁。
 
 ```bash
-# idle → online
+# idle → online（也可直接用 POST /api/accounts/:id/connect，效果相同）
 curl -X POST http://localhost:3000/api/accounts/acct-1/transition \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"to":"online","expectedFrom":"idle"}'
 
-# online → rate_limited（带 60s 限流）
-curl -X POST http://localhost:3000/api/accounts/acct-1/transition \
-  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"to":"rate_limited","expectedFrom":"online","retryAfterSeconds":60}'
+# rate_limited 不能手动转移——它只由网关返回 429 触发。
+# 模拟 429 限流（60s，之后自动恢复 online）：
+curl -X POST http://localhost:3100/_mock/accounts/acct-1/rate-limit \
+  -H 'Content-Type: application/json' -d '{"retryAfterSeconds":60}'
 
 # 查看状态
 curl http://localhost:3000/api/accounts -H "Authorization: Bearer $TOKEN"
 ```
 
 状态转移图：`idle ⇄ online → rate_limited → online`，`online → disconnected → idle`。
-非法转移或 `expectedFrom` 不匹配返回 409。
+非法转移、`expectedFrom` 不匹配返回 409；手动转 `rate_limited` 返回 400（网关 429 专属）。
 
 ### 3. 建群与消息时间线
 
 建群是异步 job：受理后返回 202 + jobId，由 `GroupJobWorker` 调网关完成建群+入群。
+**建群要求所有参与账号在线**，需先连接：
 
 ```bash
+# 前置：连接建群涉及的账号（creator + 成员），否则返回 400 ACCOUNT_NOT_ONLINE
+for a in acct-1 acct-2; do
+  curl -X POST http://localhost:3000/api/accounts/$a/connect \
+    -H "Authorization: Bearer $TOKEN"
+done
+
 # 建群（creator=acct-1，成员=[acct-2]）
 JOB=$(curl -s -X POST http://localhost:3000/api/groups \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"creatorAccountId":"acct-1","memberAccountIds":["acct-2"]}')
 JOB_ID=$(echo "$JOB" | grep -o '"jobId":"[^"]*"' | cut -d'"' -f4)
 
-# 轮询 job 状态（accepted → done）
+# 轮询 job 状态（running → finished；失败为 failed 并带 errors[]）
 curl http://localhost:3000/api/jobs/$JOB_ID -H "Authorization: Bearer $TOKEN"
 
 # 群列表
@@ -265,15 +272,29 @@ AGENT_API_KEY: sk-...             # 必填，缺失则启动即失败
 ./scripts/test-e2e-s6-s8.sh   # S6 Agent 坏响应 / S7 序列并发 201+409 / S8 占位符预检 422
 ```
 
+**部署冒烟（一键部署后建议首先执行）**：约 30 秒验证整套部署的主链路——
+5 服务可达、schemaVersion 与 migrations 一致、登录/viewer 403、建群 finished、消息 sent、agent run finished。
+
+```bash
+./scripts/test-smoke.sh       # 部署冒烟（步骤 1 自愈事件流水线，任意历史状态下都可运行）
+./scripts/test-all.sh         # 总入口：按序执行下面 7 个 HTTP/协议级集成脚本
+```
+
 其余集成脚本：
 
 ```bash
 ./scripts/test-gateway-mock.sh    # 网关模拟器契约 + 故障注入自测
 ./scripts/test-group-job.sh       # 建群 job 全流程 + JOIN_TIMEOUT
+./scripts/test-auth-session.sh    # B3 会话：refresh 轮换 / 复用全家作废 / logout
+./scripts/test-leave-all.sh       # B2 全员退群（含网关 500 瞬时重试）
 ./scripts/test-event-recovery.sh  # 停机恢复 INV-4（断流补齐）
 ./scripts/test-ws-reconnect.sh    # WebSocket 断线重连 + sinceSeq 补发
 ./scripts/test-playwright.sh      # C3：Playwright UI 自动化（首次自动下载 chromium）
 ```
+
+> 脚本隔离约定：对网关执行 `resetEventCounter`（事件 id 归零）的脚本，都会同步
+> `TRUNCATE events_inbox` 并把后端 `events_cursor` 游标归零——否则旧高游标会跳过
+> 新事件、旧 inbox 行会与新事件撞 PK 被判重（表现为建群 JOIN_TIMEOUT）。
 
 ---
 
@@ -289,6 +310,10 @@ npm install
 npm run migrate              # 应用迁移
 npm run dev                  # 启动后端（热重载，端口 3000）
 ```
+
+npm scripts（`dev` / `migrate` / `migrate:check` / `start`）通过 Node 的
+`--env-file-if-exists=.env` 自动加载 backend 目录下的 `.env`，无需 dotenv；
+shell 中已导出的同名环境变量优先级更高。需要 Node ≥ 20.12（见 package.json engines）。
 
 ## 常用命令（backend/）
 
@@ -313,7 +338,7 @@ cd backend
 npm test
 ```
 
-当前共 244 个用例（23 个测试文件）。覆盖范围：账号状态机 6×6 转移表全枚举、
+当前共 245 个用例（23 个测试文件）。覆盖范围：账号状态机 6×6 转移表全枚举、
 CAS 乐观锁并发、终态原子事务、限流到期自动恢复、出站投递与 504 收敛、
 事件消费乱序/重复、建群 job、Agent 运行（审计/幂等/崩溃恢复/预算/取消/续跑 stepNo）、
 定时序列（占位符/黏性变量/账号选择/并发冲突）、C1 媒体（下载幂等/到期清理/run 保护）、

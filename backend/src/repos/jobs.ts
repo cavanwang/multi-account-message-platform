@@ -242,11 +242,13 @@ export class JobRepo {
     client: PoolClient,
     payload: { groupId: string; gatewayGroupId: string },
   ): Promise<string> {
+    // leaveRetries：leave 遇 500 INTERNAL_ERROR 的跨 tick 重试计数（key=accountId）
+    const fullPayload = { ...payload, leaveRetries: {} };
     const { rows } = await client.query<{ id: string }>(
       `INSERT INTO jobs (kind, status, payload)
        VALUES ('leave_all', 'running', $1::jsonb)
        RETURNING id`,
-      [JSON.stringify(payload)],
+      [JSON.stringify(fullPayload)],
     );
     const jobId = rows[0]?.id;
     if (jobId === undefined) throw new Error('创建 leave-all job 失败');

@@ -108,7 +108,10 @@ step "步骤 0：前置检查 + 状态重置"
 wait_http "$BACKEND_URL/api/health" "backend"
 wait_http "$GATEWAY_URL/_mock/state" "gateway-mock"
 curl -sf -X POST "$GATEWAY_URL/_mock/reset" -H 'content-type: application/json' \
-  -d '{"seedAccounts":["acct-1","acct-2","acct-3","acct-4"]}' >/dev/null || fail "mock reset 失败"
+  -d '{"resetEventCounter":true,"seedAccounts":["acct-1","acct-2","acct-3","acct-4"]}' >/dev/null || fail "mock reset 失败"
+# 事件计数器归零必须同步后端游标/inbox，否则 member_joined 会被跳过（JOIN_TIMEOUT）
+psql_exec "TRUNCATE events_inbox; UPDATE events_cursor SET last_seen_event_id = 0 WHERE id = 1" >/dev/null \
+  || fail "后端事件游标/inbox 重置失败"
 curl -sf -X POST "$GATEWAY_URL/_mock/behavior" -H 'content-type: application/json' \
   -d '{"joinNeverArrives":0}' >/dev/null || fail "behavior 重置失败"
 curl -sf -X POST "$GATEWAY_URL/_mock/timing" -H 'content-type: application/json' \

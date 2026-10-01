@@ -96,6 +96,13 @@ step "步骤 0：前置检查 + 重置"
 wait_http "$GATEWAY_URL/_mock/state" "gateway-mock"
 curl -sf -X POST "$GATEWAY_URL/_mock/reset" -H 'content-type: application/json' \
   -d '{"resetEventCounter":true,"seedAccounts":["acct-1","acct-2"]}' >/dev/null || fail "reset 失败"
+# 事件 id 归零后必须同步重置后端：否则旧高游标会跳过新事件，
+# 且 events_inbox 旧行会与新事件撞 PK 被判重（后续脚本将出现 JOIN_TIMEOUT）。
+# 与 test-e2e-s1-s5.sh 的重置方式保持一致。
+docker exec "${DB_CONTAINER:-multi-account-message-platform-db-1}" \
+  psql -U app -d app -q -c \
+  "TRUNCATE events_inbox; UPDATE events_cursor SET last_seen_event_id = 0 WHERE id = 1" \
+  || fail "后端事件游标/inbox 重置失败"
 curl -sf -X POST "$GATEWAY_URL/_mock/timing" -H 'content-type: application/json' \
   -d '{"profile":"fast"}' >/dev/null || fail "切换 fast 时序失败"
 log "已重置（eventId 归零）并切到 fast 时序"

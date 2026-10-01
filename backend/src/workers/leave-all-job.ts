@@ -7,7 +7,11 @@
  *   3. finish            全部成功 → status='finished'，群 status='left'
  *
  * 失败语义：
- *   - 非群主 leave 业务错误（如 500 INTERNAL_ERROR / 403 SENDER_NOT_IN_GROUP）：
+ *   - leave 返回 500 INTERNAL_ERROR（网关模拟器对 leave 有 5% 随机注入，
+ *     模拟瞬时服务端故障）：leave 是幂等动作（成员仍在群内），先跨 tick 重试，
+ *     每个账号最多重试 MAX_LEAVE_RETRIES 次（payload.leaveRetries 持久计数），
+ *     超限后才按业务错误处理。
+ *   - 非群主 leave 其它业务错误（如 403 SENDER_NOT_IN_GROUP）：
  *     记 errors[]，继续处理其余非群主；群主不退；job 最终 failed。
  *   - 群主 leave 业务错误：记 errors[]，job failed。
  *   - 网络异常（kind='network'，含 503/网络不可达）：不记 errors，下 tick 重试。
@@ -22,6 +26,12 @@ import { JobRepo, type JobRow } from '../repos/jobs.js';
 import { GroupRepo } from '../repos/groups.js';
 import { AccountRepo } from '../repos/accounts.js';
 import type { GroupGateway, LoggerLike } from '../services/gateway-client.js';
+
+/**
+ * 每个账号 leave 遇 500 INTERNAL_ERROR 的最大重试次数。
+ * 第 1 次失败记 1；≤2 时下 tick 重试；达到 3（= 1 次初调 + 2 次重试）后按业务错误处理。
+ */
+const MAX_LEAVE_RETRIES = 2;
 
 export class LeaveAllJobWorker {
   private running = false;
@@ -125,6 +135,8 @@ export class LeaveAllJobWorker {
       .sort((a, b) => a.accountId.localeCompare(b.accountId));
 
     const accountRepo = new AccountRepo(this.pool);
+    // 500 INTERNAL_ERROR 跨 tick 重试计数（payload 持久化）
+    const leaveRetries = this.readLeaveRetries(job);
 
     for (const member of nonOwners) {
       const account = await accountRepo.findByUuid(member.accountId);
@@ -156,6 +168,21 @@ export class LeaveAllJobWorker {
       }
 
       if (result.kind === 'error') {
+        if (result.code === 'INTERNAL_ERROR') {
+          // 网关 500 瞬时故障（模拟其 5% 随机注入）：幂等动作，先跨 tick 重试
+          const attempts = await this.bumpLeaveRetry(
+            client, job.id, account.accountId, leaveRetries,
+          );
+          if (attempts <= MAX_LEAVE_RETRIES) {
+            this.log.warn(
+              { jobId: job.id, accountId: account.accountId, attempts },
+              'leave-all-job: leave 500 瞬时故障，下 tick 重试',
+            );
+            continue;
+          }
+          // 重试耗尽 → 落入下面的业务错误处理（记 errors[]）
+        }
+
         if (result.code === 'SENDER_NOT_IN_GROUP') {
           // 已不在群内（可能之前已成功退但事件未消费），视为成功
           await client.query('BEGIN');
@@ -258,6 +285,21 @@ export class LeaveAllJobWorker {
     }
 
     if (result.kind === 'error') {
+      if (result.code === 'INTERNAL_ERROR') {
+        // 群主 leave 500 同样按瞬时故障有界重试（计数仍记在该账号下）
+        const attempts = await this.bumpLeaveRetry(
+          client, job.id, ownerAccount.accountId, this.readLeaveRetries(job),
+        );
+        if (attempts <= MAX_LEAVE_RETRIES) {
+          this.log.warn(
+            { jobId: job.id, accountId: ownerAccount.accountId, attempts },
+            'leave-all-job: 群主 leave 500 瞬时故障，下 tick 重试',
+          );
+          return;
+        }
+        // 重试耗尽 → 落入下面的 failJob
+      }
+
       this.log.warn(
         { jobId: job.id, accountId: ownerAccount.accountId, code: result.code },
         'leave-all-job: 群主退群业务错误',
@@ -290,6 +332,44 @@ export class LeaveAllJobWorker {
       await client.query('ROLLBACK');
       throw err;
     }
+  }
+
+  /**
+   * 读取 job payload 中的 leave 重试计数表（缺省返回空表）。
+   * key=accountId，value=该账号已遇到的 500 INTERNAL_ERROR 次数。
+   */
+  private readLeaveRetries(job: JobRow): Record<string, number> {
+    const raw = job.payload['leaveRetries'];
+    if (raw === null || typeof raw !== 'object') return {};
+    return raw as Record<string, number>;
+  }
+
+  /**
+   * 累加一次 leave 瞬时故障计数并持久化到 payload.leaveRetries（独立事务），
+   * 返回该账号最新累计次数。崩溃重启后计数不丢，避免无限重试。
+   */
+  private async bumpLeaveRetry(
+    client: PoolClient,
+    jobId: string,
+    accountId: string,
+    retries: Record<string, number>,
+  ): Promise<number> {
+    const next = (retries[accountId] ?? 0) + 1;
+    retries[accountId] = next;
+    await client.query('BEGIN');
+    try {
+      await client.query(
+        `UPDATE jobs
+         SET payload = jsonb_set(payload, '{leaveRetries}', $1::jsonb), updated_at = now()
+         WHERE id = $2`,
+        [JSON.stringify(retries), jobId],
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    }
+    return next;
   }
 
   // -------------------------------------------------------------------------
