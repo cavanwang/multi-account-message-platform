@@ -12,7 +12,7 @@
 |---|---|
 | 后端 | Node.js 22 + TypeScript（strict）+ Fastify |
 | 数据库 | PostgreSQL 16（裸 SQL + `pg`，SQL migration 管理） |
-| 前端 | 占位页面（切片 5 前端待实现） |
+| 前端 | React 18 + TypeScript + Vite（nginx 伺服 + 反代 /api、/ws） |
 | 部署 | docker-compose 一键启动 |
 
 ## 一键启动
@@ -31,7 +31,7 @@ docker compose up --build
 | PostgreSQL | localhost:5432 | 用户/口令/库名均为 `app` |
 | 消息网关模拟器 | http://localhost:3100 | 完整接口 + `/_mock` 故障注入 |
 | Agent 模拟器 | http://localhost:3200 | `/agent/turn` + `/agent/audit` + `/_mock` 行为切换 |
-| 前端占位 | http://localhost:5173 | 静态页面，指向后端 API |
+| 前端控制台 | http://localhost:5173 | 登录页：`admin/admin` 或 `viewer/viewer` |
 
 后端容器启动命令为 `node dist/db/migrate-cli.js up && node dist/index.js`：先应用所有未执行迁移，再启动服务。
 数据库 schema 落后于代码时**应用会拒绝启动**并打印明确错误。
@@ -279,7 +279,7 @@ backend/
     workers/             后台消费者（事件流、job、outbox、agent-runner、ws）
 gateway-mock/            消息网关模拟器（建群/入群/踢人/事件流 + 故障注入）
 agent-mock/              Agent 服务模拟器（/agent/turn + /agent/audit + 坏行为注入）
-frontend/                控制台前端（占位，切片 5 待实现）
+frontend/                控制台前端（React 18 + Vite；nginx 伺服并反代 /api、/ws）
 docs/plan/               实现规划文档（切片 0–5）
 scripts/                 集成测试脚本
 ```
@@ -292,13 +292,14 @@ scripts/                 集成测试脚本
 - [x] **切片 3 出站投递 + 网关事件消费**：outbox 可靠投递 / 504 收敛 / 事件幂等与乱序
 - [x] **切片 4 建群 / 时间线分页 / WebSocket**：异步建群 job / 游标分页 / sinceSeq 补发
 - [x] **切片 5 Agent（部分）**：Agent 模拟器 + 运行主循环 + 审计 + kick_user + 幂等键 + 崩溃恢复 + 大小限制 + 取消
-- [ ] 切片 5 定时序列执行（B1）
-- [ ] 切片 5 全量退群（B2）
-- [ ] 切片 5 登录会话 refresh token（B3）
-- [ ] 切片 5 前端 5 页
+- [x] **切片 5 定时序列执行（B1）**：模板/运行/步骤执行/变量占位符/账号选择
+- [x] **切片 5 全量退群（B2）**：非群主先退、群主最后退、失败记 errors[]
+- [x] **切片 5 登录会话（B3）**：refresh token 轮换、复用作废、logout 立即失效；前端自动续期 + single-flight
+- [x] **A6 前端页面 1–3**：登录 / 账号列表 / 群详情（React 18 + Vite）
+- [ ] B4 前端页面 4–5（agent run 详情、序列运行）与断线补齐验证
 
 ## 已知限制
 
 - 网关/Agent 模拟器的内部状态保存在内存中，**进程重启即清空**（题目未要求持久化）。
 - 当前 `JWT_SECRET` 为演示用固定值，生产环境应通过 secret 注入。
-- 前端为占位页面，定时序列/会话/前端控制台尚未实现。
+- 前端页面 4–5（agent run 详情、序列运行）属于 B4，尚未实现。
