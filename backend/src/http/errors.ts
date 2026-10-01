@@ -26,6 +26,10 @@ export const ErrorCode = {
   ACCOUNT_NOT_FOUND: 'ACCOUNT_NOT_FOUND',
   ILLEGAL_TRANSITION: 'ILLEGAL_TRANSITION',
   CAS_CONFLICT: 'CAS_CONFLICT',
+
+  // 出站（切片 3）
+  ACCOUNT_UNAVAILABLE: 'ACCOUNT_UNAVAILABLE',
+  ACCOUNT_NOT_IN_GROUP: 'ACCOUNT_NOT_IN_GROUP',
 } as const;
 
 export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode];

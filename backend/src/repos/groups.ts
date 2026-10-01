@@ -103,6 +103,18 @@ export class GroupRepo {
   }
 
   /**
+   * 判断账号是否为群成员（切片 3 send 端点的成员校验）。
+   * 群不存在时同样返回 false（不存在的群自然没有成员）。
+   */
+  async isMember(groupId: string, accountId: string): Promise<boolean> {
+    const { rowCount } = await this.pool.query(
+      'SELECT 1 FROM group_members WHERE group_id = $1 AND account_id = $2',
+      [groupId, accountId],
+    );
+    return (rowCount ?? 0) > 0;
+  }
+
+  /**
    * 获取账号在所有群的成员记录。
    */
   async getMembershipsByAccountId(accountId: string): Promise<GroupMemberRow[]> {
