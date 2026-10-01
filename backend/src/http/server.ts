@@ -4,6 +4,7 @@
  * 把"创建 app"与"启动进程"分开，便于测试里直接 buildServer() 而不用真的监听端口。
  */
 import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
+import websocketPlugin from '@fastify/websocket';
 import type { Server as HttpServer } from 'node:http';
 import type { Pool } from 'pg';
 import type { AppConfig } from '../config/env.js';
@@ -14,15 +15,20 @@ import { registerHealthRoutes } from './routes/health.js';
 import { registerAccountRoutes } from './routes/accounts.js';
 import { registerGroupRoutes } from './routes/groups.js';
 import { registerJobRoutes } from './routes/jobs.js';
+import { registerWsRoutes } from './routes/ws.js';
+import { WsHub } from '../services/ws-hub.js';
 
 export interface ServerDeps {
   readonly config: AppConfig;
   readonly pool: Pool;
+  /** 外部传入的 WsHub（生产环境由 index.ts 创建，供 worker 共享）。不传则内部创建。 */
+  readonly hub?: WsHub;
 }
 
 /** 构造（但不监听）Fastify 实例。 */
 export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   const { config, pool } = deps;
+  const hub = deps.hub ?? new WsHub();
 
   const app = Fastify({
     logger: {
@@ -94,9 +100,15 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     return reply.status(404).send(body);
   });
 
+  // --- WebSocket 插件（必须在注册 WS 路由之前） ---
+  await app.register(websocketPlugin);
+
   // --- 公开路由（不需要鉴权） ---
   await registerHealthRoutes(app, { config, pool });
   await registerAuthRoutes(app, { config, pool });
+
+  // --- WebSocket 路由：自行处理 auth 帧，不走 HTTP preHandler ---
+  registerWsRoutes(app, { config, pool, hub });
 
   // --- 受保护路由 ---
   // 用一个子上下文加 preHandler，避免逐个路由重复声明；

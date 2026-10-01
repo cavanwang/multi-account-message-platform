@@ -19,6 +19,8 @@ import { Reconcile504Worker } from './workers/reconcile-504.js';
 import { EventConsumer } from './workers/event-consumer.js';
 import { HttpSendGateway, HttpQueryGateway, HttpGroupGateway } from './services/gateway-client.js';
 import { GroupJobWorker } from './workers/group-job.js';
+import { WsHub } from './services/ws-hub.js';
+import { WsPublisher } from './workers/ws-publisher.js';
 
 async function main(): Promise<void> {
   let config: AppConfig;
@@ -48,11 +50,14 @@ async function main(): Promise<void> {
 
   const pool = getPool(config.databaseUrl);
 
+  // WebSocket 连接中心：被 WS 路由（登记连接）与 WsPublisher（广播）共享
+  const wsHub = new WsHub();
+
   // 后台 worker：限流到期自动恢复 online（崩溃安全，1s 周期扫描 DB）
   const rateLimitSweeper = new RateLimitSweeper(pool);
   rateLimitSweeper.start();
 
-  const app = await buildServer({ config, pool });
+  const app = await buildServer({ config, pool, hub: wsHub });
 
   // 后台 worker：出站发送（claim → 发网关 → 按错误码收敛状态）
   // 日志复用 fastify 根 logger 的 child，带 worker 名便于过滤追踪
@@ -104,6 +109,10 @@ async function main(): Promise<void> {
   );
   groupJobWorker.start();
 
+  // 后台 worker：WebSocket 事件推送（轮询 web_events → WsHub 广播）
+  const wsPublisher = new WsPublisher(pool, wsHub, { intervalMs: 500, batchSize: 100 });
+  await wsPublisher.start();
+
   // --- 优雅退出 ---
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -116,6 +125,7 @@ async function main(): Promise<void> {
       reconcileWorker.stop();
       eventConsumer.stop();
       groupJobWorker.stop();
+      wsPublisher.stop();
       await app.close();
       await closePool();
       process.exit(0);
