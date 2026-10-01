@@ -1,0 +1,270 @@
+/* 控制台全局样式：无 UI 库，保持轻量；深色侧边导航 + 浅色内容区。 */
+:root {
+  --color-primary: #2563eb;
+  --color-danger: #dc2626;
+  --color-warn-bg: #fef2f2;
+  --color-warn-border: #fca5a5;
+  --color-border: #e2e8f0;
+  --color-text: #1e293b;
+  --color-text-dim: #64748b;
+  --color-bg: #f8fafc;
+  --color-sidebar: #0f172a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    'PingFang SC',
+    'Microsoft YaHei',
+    sans-serif;
+  color: var(--color-text);
+  background: var(--color-bg);
+}
+
+/* ---- 布局 ---- */
+.layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+.sidebar {
+  width: 200px;
+  background: var(--color-sidebar);
+  color: #cbd5e1;
+  padding: 16px 0;
+  flex-shrink: 0;
+}
+
+.sidebar .brand {
+  padding: 0 16px 16px;
+  font-weight: 700;
+  color: #fff;
+  border-bottom: 1px solid #1e293b;
+  margin-bottom: 8px;
+}
+
+.sidebar a {
+  display: block;
+  padding: 10px 16px;
+  color: #cbd5e1;
+  text-decoration: none;
+}
+
+.sidebar a.active,
+.sidebar a:hover {
+  background: #1e293b;
+  color: #fff;
+}
+
+.sidebar .user {
+  margin-top: 24px;
+  padding: 12px 16px;
+  border-top: 1px solid #1e293b;
+  font-size: 13px;
+}
+
+.main {
+  flex: 1;
+  padding: 24px 32px;
+  min-width: 0;
+}
+
+/* ---- 通用组件 ---- */
+.card {
+  background: #fff;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin-bottom: 20px;
+}
+
+.card h2 {
+  margin: 0 0 12px;
+  font-size: 16px;
+}
+
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+table.data th,
+table.data td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--color-border);
+  vertical-align: top;
+}
+
+table.data th {
+  color: var(--color-text-dim);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+button.btn {
+  border: 1px solid var(--color-border);
+  background: #fff;
+  border-radius: 6px;
+  padding: 5px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  margin-right: 6px;
+}
+
+button.btn:hover:not(:disabled) {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+button.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.btn.primary {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: #fff;
+}
+
+button.btn.primary:hover:not(:disabled) {
+  color: #fff;
+  filter: brightness(1.1);
+}
+
+button.btn.danger:hover:not(:disabled) {
+  border-color: var(--color-danger);
+  color: var(--color-danger);
+}
+
+input.input {
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 14px;
+  width: 100%;
+}
+
+/* ---- 状态徽标 ---- */
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.badge.online {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.badge.idle {
+  background: #e2e8f0;
+  color: #475569;
+}
+
+.badge.disconnected {
+  background: #fef9c3;
+  color: #a16207;
+}
+
+.badge.rate_limited {
+  background: #ffedd5;
+  color: #c2410c;
+}
+
+.badge.suspended,
+.badge.session_expired {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.badge.running {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.badge.finished {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.badge.failed,
+.badge.blocked,
+.badge.cancelled {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+/* blocked 的 agent run：整行醒目高亮 */
+tr.row-blocked {
+  background: var(--color-warn-bg);
+  outline: 2px solid var(--color-warn-border);
+}
+
+/* ---- 登录页 ---- */
+.login-box {
+  max-width: 360px;
+  margin: 12vh auto;
+  background: #fff;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 32px;
+}
+
+.login-box h1 {
+  font-size: 20px;
+  margin: 0 0 24px;
+}
+
+.login-box label {
+  display: block;
+  font-size: 13px;
+  color: var(--color-text-dim);
+  margin: 12px 0 4px;
+}
+
+/* ---- 消息时间线 ---- */
+.timeline {
+  font-size: 14px;
+}
+
+.timeline .msg {
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--color-border);
+}
+
+.timeline .msg .meta {
+  font-size: 12px;
+  color: var(--color-text-dim);
+  margin-bottom: 2px;
+}
+
+.timeline .msg.own .text {
+  color: var(--color-primary);
+}
+
+.hint {
+  color: var(--color-text-dim);
+  font-size: 13px;
+}
+
+.error-text {
+  color: var(--color-danger);
+  font-size: 13px;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
