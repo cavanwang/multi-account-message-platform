@@ -7,7 +7,7 @@
 import { SignJWT, jwtVerify, type JWTPayload } from 'jose';
 import type { AppConfig } from '../config/env.js';
 
-/** 令牌里携带的声明。role 用于鉴权/授权，sid 留给 B3 的会话撤销使用。 */
+/** 令牌里携带的声明。role 用于鉴权/授权，sid 为会话 ID（B3 登出/吊销用）。 */
 export interface AccessTokenClaims extends JWTPayload {
   /** 用户 ID（users.id） */
   sub: string;
@@ -15,6 +15,8 @@ export interface AccessTokenClaims extends JWTPayload {
   username: string;
   /** 角色：admin 全权限，viewer 只读 */
   role: 'admin' | 'viewer';
+  /** refresh session id；无 sid 的旧 token 在 logout 后仍可存活到自然过期 */
+  sid?: string;
 }
 
 /** 已认证的请求主体，挂在请求对象上供路由使用。 */
@@ -22,6 +24,8 @@ export interface AuthPrincipal {
   readonly userId: string;
   readonly username: string;
   readonly role: 'admin' | 'viewer';
+  /** 会话 ID（B3）；旧 token 无 sid 时为 undefined */
+  readonly sessionId?: string | undefined;
 }
 
 const ALGORITHM = 'HS256';
@@ -37,6 +41,21 @@ export async function signAccessToken(
 ): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   return new SignJWT({ username: principal.username, role: principal.role })
+    .setProtectedHeader({ alg: ALGORITHM })
+    .setSubject(principal.userId)
+    .setIssuedAt(now)
+    .setExpirationTime(now + config.accessTokenTtlSeconds)
+    .sign(secretKey(config));
+}
+
+/** 带 sid 的签发（B3 登录会话）。 */
+export async function signAccessTokenWithSession(
+  config: AppConfig,
+  principal: Omit<AuthPrincipal, 'sessionId'>,
+  sessionId: string,
+): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  return new SignJWT({ username: principal.username, role: principal.role, sid: sessionId })
     .setProtectedHeader({ alg: ALGORITHM })
     .setSubject(principal.userId)
     .setIssuedAt(now)
@@ -62,5 +81,10 @@ export async function verifyAccessToken(
     throw new Error('token 的 role 非法');
   }
 
-  return { userId: claims.sub, username: claims.username, role: claims.role };
+  return {
+    userId: claims.sub,
+    username: claims.username,
+    role: claims.role,
+    sessionId: typeof claims.sid === 'string' ? claims.sid : undefined,
+  };
 }

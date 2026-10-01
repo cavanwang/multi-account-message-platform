@@ -117,7 +117,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   // 后续切片的业务路由都注册在这个作用域内（注意：必须 await register，
   // 否则钩子注册会晚于首次请求，出现“未鉴权就能访问”的空窗）。
   await app.register(async (protectedScope) => {
-    protectedScope.addHook('preHandler', makeAuthHook(config));
+    protectedScope.addHook('preHandler', makeAuthHook(config, pool));
   
     // 切片 2：账号管理路由
     await registerAccountRoutes(protectedScope, { config, pool });

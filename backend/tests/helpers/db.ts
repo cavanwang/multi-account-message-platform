@@ -43,7 +43,8 @@ export async function resetDb(): Promise<void> {
       outbox_messages,
       group_members,
       groups,
-      accounts
+      accounts,
+      refresh_sessions
     RESTART IDENTITY CASCADE
   `);
   await pool.query(`

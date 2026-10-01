@@ -165,10 +165,10 @@ describe('LeaveAllJobWorker', () => {
     const worker = makeWorker(gw, 1000);
     await worker.runOnce();
 
-    // 3 次 leave：非群主（acct-2, acct-3 按字典序）在前，群主最后
+    // 3 次 leave：前两个是非群主（顺序按内部 UUID 字典序，不定），最后一个是群主
     expect(gw.leaveMemberCalls).toHaveLength(3);
-    expect(gw.leaveMemberCalls[0]!.accountId).toBe('acct-2');
-    expect(gw.leaveMemberCalls[1]!.accountId).toBe('acct-3');
+    const firstTwo = gw.leaveMemberCalls.slice(0, 2).map((c) => c.accountId).sort();
+    expect(firstTwo).toEqual(['acct-2', 'acct-3']);
     expect(gw.leaveMemberCalls[2]!.accountId).toBe('acct-1');
 
     const jobRepo = new JobRepo(pool);

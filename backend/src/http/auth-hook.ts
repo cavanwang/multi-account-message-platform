@@ -10,9 +10,11 @@
  * 查询类端点），需要改为在路由上显式声明 requiredRole，而不是依赖方法名推断。
  */
 import type { FastifyReply, FastifyRequest } from 'fastify';
+import type { Pool } from 'pg';
 import type { AppConfig } from '../config/env.js';
 import { AppError } from './errors.js';
 import { verifyAccessToken, type AuthPrincipal } from '../auth/tokens.js';
+import { SessionRepo } from '../repos/sessions.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -31,7 +33,7 @@ function extractBearerToken(header: string | undefined): string | undefined {
 }
 
 /** 鉴权 + 授权钩子，注册为全局 preHandler。 */
-export function makeAuthHook(config: AppConfig) {
+export function makeAuthHook(config: AppConfig, pool: Pool) {
   return async function authHook(request: FastifyRequest, _reply: FastifyReply): Promise<void> {
     const token = extractBearerToken(request.headers.authorization);
     if (token === undefined) {
@@ -44,6 +46,14 @@ export function makeAuthHook(config: AppConfig) {
     } catch {
       // 签名错误、过期、结构非法都归为 401，且不区分原因（避免泄露信息）
       throw AppError.unauthorized('access token 无效或已过期');
+    }
+
+    // B3：带 sid 的 token 必须对应一个有效（未吊销）的会话；logout 后立即失效
+    if (principal.sessionId !== undefined) {
+      const session = await new SessionRepo(pool).findById(principal.sessionId);
+      if (session === undefined || session.revokedAt !== null) {
+        throw AppError.unauthorized('会话已失效，请重新登录');
+      }
     }
 
     request.principal = principal;

@@ -121,7 +121,7 @@ export class LeaveAllJobWorker {
     const members = await groupRepo.listMembers(groupId);
     const nonOwners = members
       .filter((m) => m.role !== 'creator')
-      // 按 accountId 字典序排序，保证顺序稳定
+      // 按内部 account_id（UUID）字典序排序，保证同一数据集下顺序稳定
       .sort((a, b) => a.accountId.localeCompare(b.accountId));
 
     const accountRepo = new AccountRepo(this.pool);
