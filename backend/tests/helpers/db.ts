@@ -26,6 +26,10 @@ afterAll(async () => {
 export async function resetDb(): Promise<void> {
   await pool.query(`
     TRUNCATE TABLE
+      pending_reconciliations,
+      events_inbox,
+      events_cursor,
+      messages,
       web_events,
       sequence_steps,
       sequence_runs,
@@ -39,6 +43,8 @@ export async function resetDb(): Promise<void> {
     INSERT INTO accounts (account_id, status, version)
     VALUES ('acct-1','idle',1), ('acct-2','idle',1), ('acct-3','idle',1), ('acct-4','idle',1)
   `);
+  // events_cursor 是单行表，TRUNCATE 后恢复初始行（与迁移 0006 一致）
+  await pool.query(`INSERT INTO events_cursor (id, last_seen_event_id) VALUES (1, 0)`);
 }
 
 /** 查询单行（无结果返回 undefined）。 */
