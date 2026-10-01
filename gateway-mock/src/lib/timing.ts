@@ -11,10 +11,11 @@
  *
  * 注意：压缩只影响"等待时长"，不影响任何业务语义（谁先谁后、谁成功谁失败）。
  */
+import type { TimingProfile, TimingProfileName } from '../types.js';
 import { config } from '../config.js';
 
 /** 实时档案：完全按题面给出的数字。 */
-const REAL = {
+const REAL: TimingProfile = {
   /** POST /groups/:id/send 返回 202 之前的延迟 */
   sendAcceptedDelayMin: 0,
   sendAcceptedDelayMax: 2000,
@@ -34,7 +35,7 @@ const REAL = {
 };
 
 /** fast 档案：把最坏情况也压到 30ms 以内，同时保留"最短 < 最长"的量级关系。 */
-const FAST = {
+const FAST: TimingProfile = {
   sendAcceptedDelayMin: 0,
   sendAcceptedDelayMax: 10,
   messageSentDelayMin: 1,
@@ -47,23 +48,23 @@ const FAST = {
   shuffleWindowMax: 10,
 };
 
-export const TIMING_PROFILES = { real: REAL, fast: FAST };
+export const TIMING_PROFILES: Record<TimingProfileName, TimingProfile> = { real: REAL, fast: FAST };
 
 /** 当前生效的时序档案；可通过 POST /_mock/timing 切换。 */
-let currentName = TIMING_PROFILES[config.timingProfile] !== undefined ? config.timingProfile : 'real';
-let current = TIMING_PROFILES[currentName];
+let currentName: TimingProfileName = TIMING_PROFILES[config.timingProfile] !== undefined ? config.timingProfile : 'real';
+let current: TimingProfile = TIMING_PROFILES[currentName];
 
-export function timing() {
+export function timing(): TimingProfile {
   return current;
 }
 
 /** 当前档案名，供 /_mock/state 展示。 */
-export function currentTimingProfile() {
+export function currentTimingProfile(): TimingProfileName {
   return currentName;
 }
 
 /** 切换时序档案，返回是否成功（未知档案名返回 false）。 */
-export function setTimingProfile(name) {
+export function setTimingProfile(name: TimingProfileName): boolean {
   const profile = TIMING_PROFILES[name];
   if (profile === undefined) return false;
   current = profile;
@@ -75,12 +76,12 @@ export function setTimingProfile(name) {
  * 把题面给定的固定毫秒数按当前档案比例缩放。
  * 用于那些不在区间里、但需要整体压缩的等待（例如 10 秒静默窗口）。
  */
-export function scaled(realMs) {
+export function scaled(realMs: number): number {
   return Math.round((realMs * current.networkTimeoutConvergence) / REAL.networkTimeoutConvergence);
 }
 
 /** 在 [min, max] 内取随机整数（含端点）。 */
-export function randBetween(min, max) {
+export function randBetween(min: number, max: number): number {
   if (max <= min) return min;
   return min + Math.floor(Math.random() * (max - min + 1));
 }

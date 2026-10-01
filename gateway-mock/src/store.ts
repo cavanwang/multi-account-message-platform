@@ -13,40 +13,33 @@ import { publish } from './lib/event-bus.js';
 import { derivePlatformUserId, newGroupId, newMsgId, newInviteLink } from './lib/ids.js';
 import { timing, randBetween } from './lib/timing.js';
 import { config } from './config.js';
+import type {
+  Account,
+  AccountStatus,
+  Group,
+  Member,
+  MemberRole,
+  Invite,
+  MessageRecord,
+  ClientMsgRef,
+  ReinjectEntry,
+} from './types.js';
 
 // ---------------------------------------------------------------------------
 // 状态
 // ---------------------------------------------------------------------------
 
-/**
- * accountId -> {
- *   accountId, status, platformUserId,
- *   rateLimitedUntil: number|null,   // 限流到期时间戳(ms)
- *   retryAfterSeconds: number|null,  // 最近一次限流返回的 retryAfterSeconds
- *   joinedGroups: Set<groupId>,
- * }
- *
- * status: idle | online | disconnected | suspended | session_expired
- */
-const accounts = new Map();
+/** accountId -> Account */
+const accounts = new Map<string, Account>();
 
-/**
- * groupId -> {
- *   groupId, creatorAccountId, ownerPlatformUserId,
- *   members: Map<platformUserId, { platformUserId, accountId|null, role }>,
- *   writeForbidden: boolean,
- *   invites: Map<inviteLink, { readyAt: number, expiresAt: number|null }>,
- *   joinTimers: Set<Timeout>,
- *   joined: boolean,      // 逻辑上是否存在（解散后仍保留，便于返回确定性错误）
- * }
- */
-const groups = new Map();
+/** groupId -> Group */
+const groups = new Map<string, Group>();
 
-/** msgId -> { msgId, groupId, senderPlatformUserId, text, sentAt, clientMsgId|null, mediaUrl|null } */
-const messages = new Map();
+/** msgId -> MessageRecord */
+const messages = new Map<string, MessageRecord>();
 
-/** `${groupId}::${clientMsgId}` -> [{ msgId, sentAt }]，保留全部，查询时返回最早一条 */
-const clientMsgIndex = new Map();
+/** `${groupId}::${clientMsgId}` -> ClientMsgRef[]，保留全部，查询时返回最早一条 */
+const clientMsgIndex = new Map<string, ClientMsgRef[]>();
 
 /** 行为开关（由 /_mock/behavior 控制）。 */
 export const behavior = {
@@ -58,10 +51,10 @@ export const behavior = {
 
 /** group / account 级的一次性故障（由 /_mock/groups、/_mock/accounts 控制）。 */
 const oneShotFaults = {
-  kickTimeoutGroups: new Set(), // 下一次 kick 返回 504 的群
+  kickTimeoutGroups: new Set<string>(), // 下一次 kick 返回 504 的群
 };
 
-function sleep(ms) {
+export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -74,7 +67,11 @@ function sleep(ms) {
  * message 与题面错误码保持一致（如 RATE_LIMITED、ACCOUNT_OFFLINE）。
  */
 export class GatewayError extends Error {
-  constructor(status, code, extra = {}) {
+  readonly status: number;
+  readonly code: string;
+  readonly extra: Record<string, unknown>;
+
+  constructor(status: number, code: string, extra: Record<string, unknown> = {}) {
     super(code);
     this.name = 'GatewayError';
     this.status = status;
@@ -88,7 +85,7 @@ export class GatewayError extends Error {
 // ---------------------------------------------------------------------------
 
 /** 初始化预置账号。 */
-export function seedAccounts(accountIds) {
+export function seedAccounts(accountIds: readonly string[]): void {
   for (const accountId of accountIds) {
     if (accounts.has(accountId)) continue;
     accounts.set(accountId, {
@@ -102,11 +99,16 @@ export function seedAccounts(accountIds) {
   }
 }
 
-export function getAccount(accountId) {
+export function getAccount(accountId: string): Account | undefined {
   return accounts.get(accountId);
 }
 
-export function listAccounts() {
+export function listAccounts(): Array<{
+  accountId: string;
+  status: AccountStatus;
+  platformUserId: string | null;
+  rateLimitedUntil: number | null;
+}> {
   return [...accounts.values()].map((a) => ({
     accountId: a.accountId,
     status: a.status,
@@ -119,7 +121,7 @@ export function listAccounts() {
  * 账号终态检查：suspended / session_expired 之后，该账号**所有请求**都返回同样错误。
  * 返回 null 表示没有问题。
  */
-function terminalError(account) {
+function terminalError(account: Account): GatewayError | null {
   if (account.status === 'suspended') {
     return new GatewayError(403, 'ACCOUNT_SUSPENDED');
   }
@@ -133,10 +135,14 @@ function terminalError(account) {
  * 把账号推入终态（suspended / session_expired），并执行题面要求的连带后果：
  * 移出所有群 + 推 member_left。
  *
- * @param {boolean} pushAccountStatus 是否同时推一条 account_status 事件。
+ * @param pushAccountStatus 是否同时推一条 account_status 事件。
  *        题面对该事件用词是"可能（不保证）"，因此这里做成可开关，方便后端两边都测。
  */
-export function markAccountTerminal(accountId, status, { pushAccountStatus = true } = {}) {
+export function markAccountTerminal(
+  accountId: string,
+  status: 'suspended' | 'session_expired',
+  { pushAccountStatus = true }: { pushAccountStatus?: boolean } = {}
+): Account {
   const account = accounts.get(accountId);
   if (account === undefined) throw new GatewayError(404, 'ACCOUNT_NOT_FOUND');
   if (account.status === 'suspended' || account.status === 'session_expired') {
@@ -161,7 +167,7 @@ export function markAccountTerminal(accountId, status, { pushAccountStatus = tru
 }
 
 /** 给账号设置限流。 */
-export function setRateLimit(accountId, retryAfterSeconds) {
+export function setRateLimit(accountId: string, retryAfterSeconds: number): Account {
   const account = accounts.get(accountId);
   if (account === undefined) throw new GatewayError(404, 'ACCOUNT_NOT_FOUND');
   account.status = 'rate_limited';
@@ -171,7 +177,7 @@ export function setRateLimit(accountId, retryAfterSeconds) {
 }
 
 /** 限流是否仍然生效；过期则自动回 online（网关侧的到期恢复）。 */
-function activeRateLimit(account) {
+function activeRateLimit(account: Account): number | null {
   if (account.status !== 'rate_limited') return null;
   if (account.rateLimitedUntil !== null && Date.now() >= account.rateLimitedUntil) {
     // 网关侧自动恢复；注意后端也有自己的 sweep，两边都应能独立正确
@@ -187,7 +193,7 @@ function activeRateLimit(account) {
  * connect：返回（必要时创建）platformUserId。
  * 同一 accountId 每次 connect 返回同一个 platformUserId。
  */
-export function connectAccount(accountId) {
+export function connectAccount(accountId: string): { platformUserId: string } {
   const account = accounts.get(accountId);
   if (account === undefined) throw new GatewayError(404, 'ACCOUNT_NOT_FOUND');
 
@@ -203,7 +209,7 @@ export function connectAccount(accountId) {
 }
 
 /** disconnect：账号离线。 */
-export function disconnectAccount(accountId) {
+export function disconnectAccount(accountId: string): Record<string, never> {
   const account = accounts.get(accountId);
   if (account === undefined) throw new GatewayError(404, 'ACCOUNT_NOT_FOUND');
 
@@ -220,7 +226,7 @@ export function disconnectAccount(accountId) {
  * 出站动作的通用前置检查（send / join / promote / kick / leave 共用）。
  * 返回 { account, group } 或抛出对应的网关错误。
  */
-function assertCanAct(accountId, groupId) {
+function assertCanAct(accountId: string, groupId: string): { account: Account; group: Group } {
   const account = accounts.get(accountId);
   if (account === undefined) throw new GatewayError(404, 'ACCOUNT_NOT_FOUND');
 
@@ -242,7 +248,7 @@ function assertCanAct(accountId, groupId) {
 // ---------------------------------------------------------------------------
 
 /** 建群：创建者即群主，响应返回时已是成员；**不**推 member_joined。 */
-export function createGroup(creatorAccountId) {
+export function createGroup(creatorAccountId: string): { groupId: string } {
   const account = accounts.get(creatorAccountId);
   if (account === undefined) throw new GatewayError(404, 'ACCOUNT_NOT_FOUND');
 
@@ -255,7 +261,7 @@ export function createGroup(creatorAccountId) {
 
   const groupId = newGroupId();
   const ownerPlatformUserId = account.platformUserId;
-  const group = {
+  const group: Group = {
     groupId,
     creatorAccountId,
     ownerPlatformUserId,
@@ -270,12 +276,12 @@ export function createGroup(creatorAccountId) {
   return { groupId };
 }
 
-export function getGroup(groupId) {
+export function getGroup(groupId: string): Group | undefined {
   return groups.get(groupId);
 }
 
 /** 群成员列表（平台视角）。 */
-export function listMembers(groupId) {
+export function listMembers(groupId: string): Array<{ platformUserId: string }> {
   const group = groups.get(groupId);
   if (group === undefined) throw new GatewayError(404, 'GROUP_NOT_FOUND');
   return [...group.members.keys()].map((platformUserId) => ({ platformUserId }));
@@ -287,7 +293,7 @@ export function listMembers(groupId) {
  * 注意顺序：**先改成员列表，再（延迟）推事件**。这样调用方在收到
  * 200 响应后的任意时刻查成员列表，看到的都已经是"移除后"的状态。
  */
-function removeMember(groupId, platformUserId, { scheduleEvent = true } = {}) {
+function removeMember(groupId: string, platformUserId: string, { scheduleEvent = true }: { scheduleEvent?: boolean } = {}): boolean {
   const group = groups.get(groupId);
   if (group === undefined) return false;
 
@@ -303,25 +309,31 @@ function removeMember(groupId, platformUserId, { scheduleEvent = true } = {}) {
   if (scheduleEvent) {
     // 题面：kick 场景下"目标在 200 返回前已从成员列表移除，随后推 member_left"
     const delay = randBetween(timing().kickDelayMin, timing().kickDelayMax);
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       publish('member_left', { groupId, platformUserId });
     }, Math.min(delay, timing().kickDelayMax));
+    // 注意：这里没有把 timer 加入 group.joinTimers，因为 kick 的 timer 不需要 reset 时清理
+    // 如果需要，可以类似 joinGroup 那样处理
   }
   return true;
 }
 
 /** 申请邀请链接。readyAfterMs 可能为 0，也可能几秒；链接可能任意时刻过期。 */
-export function createInvite(groupId, { readyAfterMs, ttlMs } = {}) {
+export function createInvite(
+  groupId: string,
+  { readyAfterMs, ttlMs }: { readyAfterMs?: number; ttlMs?: number } = {}
+): { inviteLink: string; readyAfterMs: number } {
   const group = groups.get(groupId);
   if (group === undefined) throw new GatewayError(404, 'GROUP_NOT_FOUND');
 
   const inviteLink = newInviteLink();
   const readyDelay = readyAfterMs ?? (Math.random() < 0.5 ? 0 : randBetween(1000, 3000));
-  group.invites.set(inviteLink, {
+  const invite: Invite = {
     readyAt: Date.now() + readyDelay,
     // 默认不过期；测试可用 /_mock 强制设置过期
     expiresAt: ttlMs === undefined ? null : Date.now() + ttlMs,
-  });
+  };
+  group.invites.set(inviteLink, invite);
   return { inviteLink, readyAfterMs: readyDelay };
 }
 
@@ -329,7 +341,7 @@ export function createInvite(groupId, { readyAfterMs, ttlMs } = {}) {
  * join：仅表示"受理"，真正入群以随后的 member_joined 为准。
  * 可能永远不推 member_joined（此时账号并未入群）。
  */
-export function joinGroup(groupId, accountId, inviteLink) {
+export function joinGroup(groupId: string, accountId: string, inviteLink: string): { accepted: true } {
   const { account, group } = assertCanAct(accountId, groupId);
 
   if (group.writeForbidden) {
@@ -372,7 +384,8 @@ export function joinGroup(groupId, accountId, inviteLink) {
     if (group.members.has(platformUserId)) return;
 
     // 成员列表先变，事件随后推出
-    group.members.set(platformUserId, { platformUserId, accountId, role: 'member' });
+    const member: Member = { platformUserId, accountId, role: 'member' };
+    group.members.set(platformUserId, member);
     account.joinedGroups.add(groupId);
     publish('member_joined', { groupId, platformUserId });
   }, delay);
@@ -385,7 +398,7 @@ export function joinGroup(groupId, accountId, inviteLink) {
  * promote：byAccountId 必须是群主；对方需已入群。
  * 题面：promote **不推事件**。
  */
-export function promoteMember(groupId, byAccountId, accountId) {
+export function promoteMember(groupId: string, byAccountId: string, accountId: string): Record<string, never> {
   const group = groups.get(groupId);
   if (group === undefined) throw new GatewayError(404, 'GROUP_NOT_FOUND');
 
@@ -407,7 +420,9 @@ export function promoteMember(groupId, byAccountId, accountId) {
   }
 
   const member = group.members.get(target.platformUserId);
-  member.role = 'admin';
+  if (member !== undefined) {
+    member.role = 'admin';
+  }
   return {};
 }
 
@@ -418,7 +433,7 @@ export function promoteMember(groupId, byAccountId, accountId) {
  *  - 群主已退群 → 409 OWNER_LEFT（优先于权限检查）
  *  - 非群主且未被 promote → 403 NO_PERMISSION
  */
-export function kickMember(groupId, byAccountId, targetPlatformUserId) {
+export function kickMember(groupId: string, byAccountId: string, targetPlatformUserId: string): { kicked: true } {
   const group = groups.get(groupId);
   if (group === undefined) throw new GatewayError(404, 'GROUP_NOT_FOUND');
 
@@ -444,7 +459,7 @@ export function kickMember(groupId, byAccountId, targetPlatformUserId) {
 }
 
 /** leave：200 + 随后 member_left；也可能返回 500（没退成）。 */
-export function leaveGroup(groupId, accountId) {
+export function leaveGroup(groupId: string, accountId: string): { wasOwner: boolean } {
   const { account, group } = assertCanAct(accountId, groupId);
 
   if (account.platformUserId === null || !group.members.has(account.platformUserId)) {
@@ -470,9 +485,23 @@ export function leaveGroup(groupId, accountId) {
  * 记录一条消息并分配 msgId / sentAt。返回 msgId。
  * 同时写入 clientMsgId 索引，供 by-client-id 查询使用。
  */
-export function recordMessage({ groupId, senderPlatformUserId, text, sentAt, clientMsgId, mediaUrl = null }) {
+export function recordMessage({
+  groupId,
+  senderPlatformUserId,
+  text,
+  sentAt,
+  clientMsgId,
+  mediaUrl = null,
+}: {
+  groupId: string;
+  senderPlatformUserId: string | null;
+  text: string;
+  sentAt: string;
+  clientMsgId?: string | null;
+  mediaUrl?: string | null;
+}): string {
   const msgId = newMsgId();
-  const record = {
+  const record: MessageRecord = {
     msgId,
     groupId,
     senderPlatformUserId,
@@ -496,7 +525,7 @@ export function recordMessage({ groupId, senderPlatformUserId, text, sentAt, cli
  * send 的前置校验（不含 202 延迟）。返回 { account, group }。
  * 网关**不按 clientMsgId 去重**，因此这里不做任何幂等处理。
  */
-export function assertCanSend(groupId, accountId) {
+export function assertCanSend(groupId: string, accountId: string): { account: Account; group: Group } {
   const { account, group } = assertCanAct(accountId, groupId);
 
   if (group.writeForbidden) {
@@ -518,7 +547,13 @@ export function assertCanSend(groupId, accountId) {
  * 受理一条 send：延迟后推 message_sent 或 message_failed。
  * send 返回 202 本身也要延迟（题面：202 可能一两秒才返回）。
  */
-export async function acceptSend(groupId, accountId, clientMsgId, text, { shouldFail = false, failCode = 'ACCOUNT_SUSPENDED' } = {}) {
+export async function acceptSend(
+  groupId: string,
+  accountId: string,
+  clientMsgId: string,
+  text: string,
+  { shouldFail = false, failCode = 'ACCOUNT_SUSPENDED' }: { shouldFail?: boolean; failCode?: string } = {}
+): Promise<{ accepted: true }> {
   const acceptedDelay = randBetween(timing().sendAcceptedDelayMin, timing().sendAcceptedDelayMax);
   if (acceptedDelay > 0) await sleep(acceptedDelay);
 
@@ -553,7 +588,7 @@ export async function acceptSend(groupId, accountId, clientMsgId, text, { should
   return { accepted: true };
 }
 
-function findPlatformUserId(accountId) {
+function findPlatformUserId(accountId: string): string | null {
   return accounts.get(accountId)?.platformUserId ?? null;
 }
 
@@ -561,18 +596,19 @@ function findPlatformUserId(accountId) {
  * by-client-id 查询。
  * 同一 clientMsgId 落地多条时返回**最早的一条**。
  */
-export function findByClientMsgId(groupId, clientMsgId) {
+export function findByClientMsgId(groupId: string, clientMsgId: string): ClientMsgRef | null {
   const list = clientMsgIndex.get(`${groupId}::${clientMsgId}`);
   if (list === undefined || list.length === 0) return null;
   // 最早的一条：按 sentAt 升序，sentAt 相同则按插入顺序
-  return [...list].sort((a, b) => (a.sentAt < b.sentAt ? -1 : a.sentAt > b.sentAt ? 1 : 0))[0];
+  const sorted = [...list].sort((a, b) => (a.sentAt < b.sentAt ? -1 : a.sentAt > b.sentAt ? 1 : 0));
+  return sorted[0] ?? null;
 }
 
 /**
  * 为一组消息补投事件：使用原始 msgId/sentAt，但分配**新的（更大的）eventId**。
  * 这正是题面描述的"离线账号之前发过的消息之后通过事件流补投"。
  */
-export function reinjectMessages(entries) {
+export function reinjectMessages(entries: readonly ReinjectEntry[]): void {
   for (const entry of entries) {
     const msgId = recordMessage({
       groupId: entry.groupId,
@@ -601,16 +637,17 @@ export function reinjectMessages(entries) {
  * 模拟外部用户（非服务账号）入群：直接改成员列表并推 member_joined。
  * 题面明确"外部用户进出群也会推"这两个事件。
  */
-export function externalJoin(groupId, platformUserId) {
+export function externalJoin(groupId: string, platformUserId: string): { joined: boolean } {
   const group = groups.get(groupId);
   if (group === undefined) throw new GatewayError(404, 'GROUP_NOT_FOUND');
   if (group.members.has(platformUserId)) return { joined: false };
-  group.members.set(platformUserId, { platformUserId, accountId: null, role: 'member' });
+  const member: Member = { platformUserId, accountId: null, role: 'member' };
+  group.members.set(platformUserId, member);
   publish('member_joined', { groupId, platformUserId });
   return { joined: true };
 }
 
-export function externalLeave(groupId, platformUserId) {
+export function externalLeave(groupId: string, platformUserId: string): { left: boolean } {
   const group = groups.get(groupId);
   if (group === undefined) throw new GatewayError(404, 'GROUP_NOT_FOUND');
   if (!group.members.has(platformUserId)) return { left: false };
@@ -619,7 +656,7 @@ export function externalLeave(groupId, platformUserId) {
 }
 
 /** 把群标记为不可写（解散或禁言），与账号无关。 */
-export function setWriteForbidden(groupId, on) {
+export function setWriteForbidden(groupId: string, on: boolean): { writeForbidden: boolean } {
   const group = groups.get(groupId);
   if (group === undefined) throw new GatewayError(404, 'GROUP_NOT_FOUND');
   group.writeForbidden = on === true;
@@ -627,7 +664,7 @@ export function setWriteForbidden(groupId, on) {
 }
 
 /** 让群主退群（用于制造 409 OWNER_LEFT 场景）。 */
-export function ownerLeave(groupId) {
+export function ownerLeave(groupId: string): { left: true } {
   const group = groups.get(groupId);
   if (group === undefined) throw new GatewayError(404, 'GROUP_NOT_FOUND');
   removeMember(groupId, group.ownerPlatformUserId, { scheduleEvent: true });
@@ -639,7 +676,24 @@ export function ownerLeave(groupId) {
 // ---------------------------------------------------------------------------
 
 /** 导出全量状态，供测试断言（例如"网关里恰好一条消息"）。 */
-export function dumpState() {
+export function dumpState(): {
+  accounts: Array<{
+    accountId: string;
+    status: AccountStatus;
+    platformUserId: string | null;
+    rateLimitedUntil: number | null;
+    joinedGroups: string[];
+  }>;
+  groups: Array<{
+    groupId: string;
+    creatorAccountId: string;
+    ownerPlatformUserId: string;
+    writeForbidden: boolean;
+    members: Array<{ platformUserId: string; accountId: string | null; role: MemberRole }>;
+  }>;
+  messages: MessageRecord[];
+  clientMsgCounts: Record<string, number>;
+} {
   return {
     accounts: [...accounts.values()].map((a) => ({
       accountId: a.accountId,
@@ -668,7 +722,7 @@ export function dumpState() {
  * 理由：eventId 全局单调递增是网关的对外契约，清零会让"事件流从服务启动即推送"
  * 与 since 补拉的语义变得难以验证；测试之间靠 eventId 的连续性区分新旧事件。
  */
-export function resetState() {
+export function resetState(): void {
   for (const group of groups.values()) {
     for (const timer of group.joinTimers) clearTimeout(timer);
   }
@@ -686,12 +740,12 @@ export function resetState() {
 // 一次性故障（供 kick 的 504 场景）
 // ---------------------------------------------------------------------------
 
-export function armKickTimeout(groupId) {
+export function armKickTimeout(groupId: string): void {
   oneShotFaults.kickTimeoutGroups.add(groupId);
 }
 
-export function consumeKickTimeout(groupId) {
+export function consumeKickTimeout(groupId: string): boolean {
   return oneShotFaults.kickTimeoutGroups.delete(groupId);
 }
 
-export { sleep, timing, randBetween };
+export { timing, randBetween };

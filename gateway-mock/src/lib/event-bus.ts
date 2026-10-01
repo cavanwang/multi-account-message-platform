@@ -12,9 +12,10 @@
  */
 import { EventEmitter } from 'node:events';
 import { timing, randBetween } from './timing.js';
+import type { GatewayEvent, GatewayEventType, EventBody } from '../types.js';
 
 /** 已产生的事件，按 eventId 升序排列（索引即 eventId - 1 的近似，但不依赖这一点）。 */
-const history = [];
+const history: GatewayEvent[] = [];
 let nextEventId = 1;
 
 /** 投递行为开关。 */
@@ -31,17 +32,17 @@ emitter.setMaxListeners(0); // 客户端数量不设上限
 
 /**
  * 追加一个事件。
- * @param {string} type 事件类型：message | message_sent | message_failed | member_joined | member_left | account_status
- * @param {object} data 事件负载（会补上 eventId 与 type 两个字段）
- * @returns {object} 完整事件对象
+ * @param type 事件类型
+ * @param data 事件负载（会补上 eventId 与 type 两个字段）
+ * @returns 完整事件对象
  */
-export function publish(type, data) {
+export function publish<K extends GatewayEventType>(type: K, data: EventBody<K>): GatewayEvent {
   // 注意展开顺序：eventId 与 type 放最后，保证调用方传入的同名键无法覆盖权威值
   const event = {
     ...data,
     eventId: nextEventId++,
     type,
-  };
+  } as GatewayEvent;
   history.push(event);
 
   scheduleDelivery(event);
@@ -57,8 +58,8 @@ export function publish(type, data) {
  *
  * 两种模式可以叠加。关闭时走直通路径，零延迟。
  */
-function scheduleDelivery(event) {
-  const push = () => emitter.emit('event', event);
+function scheduleDelivery(event: GatewayEvent): void {
+  const push = (): void => emitter.emit('event', event);
 
   if (delivery.shuffleMode) {
     const window = Math.min(timing().shuffleWindowMax, 50);
@@ -75,23 +76,23 @@ function scheduleDelivery(event) {
 }
 
 /** 订阅事件流；返回取消订阅函数。 */
-export function subscribe(listener) {
+export function subscribe(listener: (event: GatewayEvent) => void): () => void {
   emitter.on('event', listener);
   return () => emitter.off('event', listener);
 }
 
 /** 读取 eventId > since 的全部历史事件（since 为独占语义）。 */
-export function replaySince(since) {
+export function replaySince(since: number): GatewayEvent[] {
   return history.filter((e) => e.eventId > since);
 }
 
 /** 当前最大 eventId（用于 /_mock/state 与测试断言）。 */
-export function lastEventId() {
+export function lastEventId(): number {
   return nextEventId - 1;
 }
 
 /** 按 eventId 区间取事件，供 /_mock/events/replay 使用。 */
-export function eventsInRange(fromEventId, count) {
+export function eventsInRange(fromEventId: number, count: number): GatewayEvent[] {
   return history.filter((e) => e.eventId >= fromEventId).slice(0, count);
 }
 
@@ -101,20 +102,22 @@ export function eventsInRange(fromEventId, count) {
  * 与 publish 的区别：不分配新 eventId、不追加历史——这正是 at-least-once
  * 语义下"同一事件被推两次"的表现，用于验证后端的去重能力（验收场景 S2）。
  */
-export function rePublish(event) {
+export function rePublish(event: GatewayEvent): void {
   scheduleDelivery(event);
 }
 
 /** 读取/修改投递开关。 */
-export function setDuplicateMode(on) {
+export function setDuplicateMode(on: boolean): boolean {
   delivery.duplicateMode = on === true;
   return delivery.duplicateMode;
 }
-export function setShuffleMode(on) {
+
+export function setShuffleMode(on: boolean): boolean {
   delivery.shuffleMode = on === true;
   return delivery.shuffleMode;
 }
-export function deliveryFlags() {
+
+export function deliveryFlags(): { duplicateMode: boolean; shuffleMode: boolean } {
   return { duplicateMode: delivery.duplicateMode, shuffleMode: delivery.shuffleMode };
 }
 
@@ -122,18 +125,18 @@ export function deliveryFlags() {
  * 请求断开所有 SSE 连接，用于验证后端带 since 重连续传（INV-4）。
  * 本函数只负责广播；实际断开由 server 层在收到广播后关闭各连接。
  */
-export function breakAllConnections() {
+export function breakAllConnections(): void {
   emitter.emit('disconnect-requests');
 }
 
 /** 供 server 层监听"要求断开"的通道。 */
-export function onDisconnectRequest(listener) {
+export function onDisconnectRequest(listener: () => void): () => void {
   emitter.on('disconnect-requests', listener);
   return () => emitter.off('disconnect-requests', listener);
 }
 
 /** 清空历史事件与计数器——供 /_mock/reset 使用（注意：默认不清零 eventId 计数）。 */
-export function resetEventBus({ resetCounter = false } = {}) {
+export function resetEventBus({ resetCounter = false }: { resetCounter?: boolean } = {}): void {
   history.length = 0;
   delivery.duplicateMode = false;
   delivery.shuffleMode = false;

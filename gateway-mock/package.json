@@ -5,8 +5,13 @@
   "type": "module",
   "description": "消息网关模拟器：忠实实现题面 §2.1 的全部接口、时序与故障行为",
   "scripts": {
-    "start": "node src/index.js",
-    "selftest": "node scripts/selftest.js"
+    "start": "node --import=tsx src/index.ts",
+    "selftest": "node scripts/selftest.js",
+    "typecheck": "tsc --noEmit"
   },
-  "dependencies": {}
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "@types/node": "^22.9.0"
+  }
 }

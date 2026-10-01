@@ -6,6 +6,7 @@
  *
  * 全部 POST 端点返回 { ok: true, ... }。
  */
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   behavior,
   dumpState,
@@ -20,17 +21,19 @@ import {
   armKickTimeout,
   reinjectMessages,
   seedAccounts,
+  getAccount,
 } from './store.js';
 import { sendError, sendJson, readJsonBody, activeConnectionCount } from './lib/http.js';
 import * as bus from './lib/event-bus.js';
 import { setTimingProfile, TIMING_PROFILES, currentTimingProfile } from './lib/timing.js';
 import { config } from './config.js';
+import type { ReinjectEntry, AccountStatus } from './types.js';
 
 /**
  * 处理一个控制请求。
- * @returns {Promise<boolean>} 是否已处理
+ * @returns 是否已处理
  */
-export async function handle(req, res, url) {
+export async function handle(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
   const path = url.pathname;
   const method = req.method ?? 'GET';
 
@@ -57,23 +60,23 @@ export async function handle(req, res, url) {
   // --- 账号状态 ---
   let m = /^\/_mock\/accounts\/([^/]+)\/(suspend|session-expire)$/.exec(path);
   if (m) {
-    const accountId = decodeURIComponent(m[1]);
+    const accountId = decodeURIComponent(m[1]!);
     const to = m[2] === 'suspend' ? 'suspended' : 'session_expired';
     return wrap(res, async () => {
       const body = await readJsonBody(req);
       // 题面说 account_status 事件是"可能（不保证）"推送的，所以做成开关
-      const pushAccountStatus = body.pushAccountStatus !== false;
-      markAccountTerminal(accountId, to, { pushAccountStatus });
+      const pushAccountStatus = body['pushAccountStatus'] !== false;
+      markAccountTerminal(accountId, to as AccountStatus, { pushAccountStatus });
       return { ok: true, accountId, status: to, pushedAccountStatus: pushAccountStatus };
     });
   }
 
   m = /^\/_mock\/accounts\/([^/]+)\/rate-limit$/.exec(path);
   if (m) {
-    const accountId = decodeURIComponent(m[1]);
+    const accountId = decodeURIComponent(m[1]!);
     return wrap(res, async () => {
       const body = await readJsonBody(req);
-      const retryAfterSeconds = body.retryAfterSeconds ?? 5;
+      const retryAfterSeconds = (body['retryAfterSeconds'] as number) ?? 5;
       setRateLimit(accountId, retryAfterSeconds);
       return { ok: true, accountId, retryAfterSeconds };
     });
@@ -81,10 +84,9 @@ export async function handle(req, res, url) {
 
   m = /^\/_mock\/accounts\/([^/]+)\/clear-rate-limit$/.exec(path);
   if (m) {
-    const accountId = decodeURIComponent(m[1]);
+    const accountId = decodeURIComponent(m[1]!);
     return wrap(res, async () => {
       // 直接改回 online，便于测试"到期前人工干预"的分支
-      const { getAccount } = await import('../store.js');
       const account = getAccount(accountId);
       if (account === undefined) return false;
       account.status = 'online';
@@ -97,11 +99,11 @@ export async function handle(req, res, url) {
   // --- 群 ---
   m = /^\/_mock\/groups\/([^/]+)\/(external-join|external-leave)$/.exec(path);
   if (m) {
-    const groupId = decodeURIComponent(m[1]);
+    const groupId = decodeURIComponent(m[1]!);
     const action = m[2];
     return wrap(res, async () => {
       const body = await readJsonBody(req);
-      const platformUserId = body.platformUserId ?? 'pu_external_user';
+      const platformUserId = (body['platformUserId'] as string) ?? 'pu_external_user';
       return action === 'external-join'
         ? externalJoin(groupId, platformUserId)
         : externalLeave(groupId, platformUserId);
@@ -110,16 +112,16 @@ export async function handle(req, res, url) {
 
   m = /^\/_mock\/groups\/([^/]+)\/write-forbidden$/.exec(path);
   if (m) {
-    const groupId = decodeURIComponent(m[1]);
+    const groupId = decodeURIComponent(m[1]!);
     return wrap(res, async () => {
       const body = await readJsonBody(req);
-      return setWriteForbidden(groupId, body.on !== false);
+      return setWriteForbidden(groupId, (body['on'] as boolean) !== false);
     });
   }
 
   m = /^\/_mock\/groups\/([^/]+)\/owner-leave$/.exec(path);
   if (m) {
-    const groupId = decodeURIComponent(m[1]);
+    const groupId = decodeURIComponent(m[1]!);
     return wrap(res, async () => {
       return ownerLeave(groupId);
     });
@@ -127,7 +129,7 @@ export async function handle(req, res, url) {
 
   m = /^\/_mock\/groups\/([^/]+)\/kick-timeout$/.exec(path);
   if (m) {
-    const groupId = decodeURIComponent(m[1]);
+    const groupId = decodeURIComponent(m[1]!);
     return wrap(res, async () => {
       armKickTimeout(groupId);
       return { ok: true, message: '下一次该群的 kick 将返回 504 NETWORK_TIMEOUT' };
@@ -138,7 +140,8 @@ export async function handle(req, res, url) {
   if (path === '/_mock/messages/inject') {
     return wrap(res, async () => {
       const body = await readJsonBody(req);
-      const entries = Array.isArray(body) ? body : body.messages ?? [body];
+      const rawEntries = Array.isArray(body) ? body : (body['messages'] as unknown[]) ?? [body];
+      const entries = rawEntries as ReinjectEntry[];
       reinjectMessages(entries);
       return { ok: true, injected: entries.length };
     });
@@ -148,7 +151,9 @@ export async function handle(req, res, url) {
   if (path === '/_mock/events/replay') {
     return wrap(res, async () => {
       const body = await readJsonBody(req);
-      const events = bus.eventsInRange(body.fromEventId ?? 1, body.count ?? 100);
+      const fromEventId = (body['fromEventId'] as number) ?? 1;
+      const count = (body['count'] as number) ?? 100;
+      const events = bus.eventsInRange(fromEventId, count);
       // 重新推送这些事件：eventId 保持不变（这就是"重复推送"的语义）
       for (const event of events) bus.rePublish(event);
       return { ok: true, replayed: events.length };
@@ -158,7 +163,7 @@ export async function handle(req, res, url) {
   if (path === '/_mock/events/duplicate-mode') {
     return wrap(res, async () => {
       const body = await readJsonBody(req);
-      const on = bus.setDuplicateMode(body.on !== false);
+      const on = bus.setDuplicateMode((body['on'] as boolean) !== false);
       return { ok: true, duplicateMode: on };
     });
   }
@@ -166,7 +171,7 @@ export async function handle(req, res, url) {
   if (path === '/_mock/events/shuffle-mode') {
     return wrap(res, async () => {
       const body = await readJsonBody(req);
-      const on = bus.setShuffleMode(body.on !== false);
+      const on = bus.setShuffleMode((body['on'] as boolean) !== false);
       return { ok: true, shuffleMode: on };
     });
   }
@@ -183,11 +188,11 @@ export async function handle(req, res, url) {
   if (path === '/_mock/behavior') {
     return wrap(res, async () => {
       const body = await readJsonBody(req);
-      if (body.joinNeverArrives !== undefined) {
-        behavior.joinNeverArrives = Number(body.joinNeverArrives);
+      if (body['joinNeverArrives'] !== undefined) {
+        behavior.joinNeverArrives = Number(body['joinNeverArrives']);
       }
-      if (body.failJoinOnce !== undefined) {
-        behavior.failJoinOnce = body.failJoinOnce === true;
+      if (body['failJoinOnce'] !== undefined) {
+        behavior.failJoinOnce = body['failJoinOnce'] === true;
       }
       return { ok: true, behavior: { ...behavior } };
     });
@@ -197,14 +202,15 @@ export async function handle(req, res, url) {
   if (path === '/_mock/timing') {
     return wrap(res, async () => {
       const body = await readJsonBody(req);
-      const ok = setTimingProfile(body.profile);
+      const profile = body['profile'] as string;
+      const ok = setTimingProfile(profile as 'real' | 'fast');
       if (!ok) {
         sendError(res, 400, 'UNKNOWN_PROFILE', {
           available: Object.keys(TIMING_PROFILES),
         });
         return { __handled: true };
       }
-      return { ok: true, profile: body.profile };
+      return { ok: true, profile };
     });
   }
 
@@ -215,12 +221,12 @@ export async function handle(req, res, url) {
       resetState();
       // 默认不清零 eventId 计数器（与使用方确认过的决定）：
       // eventId 的全局单调性是网关对外契约，清零会让 since 补拉语义难以验证。
-      bus.resetEventBus({ resetCounter: body.resetEventCounter === true });
-      if (Array.isArray(body.seedAccounts)) seedAccounts(body.seedAccounts);
+      bus.resetEventBus({ resetCounter: body['resetEventCounter'] === true });
+      if (Array.isArray(body['seedAccounts'])) seedAccounts(body['seedAccounts'] as string[]);
       return {
         ok: true,
         reseededAccounts: config.seedAccounts,
-        eventCounterReset: body.resetEventCounter === true,
+        eventCounterReset: body['resetEventCounter'] === true,
       };
     });
   }
@@ -228,13 +234,14 @@ export async function handle(req, res, url) {
   return false;
 }
 
-async function wrap(res, fn) {
+async function wrap(res: ServerResponse, fn: () => Promise<unknown>): Promise<true> {
   try {
     const result = await fn();
     if (result !== undefined && result !== false) sendJson(res, 200, result);
   } catch (err) {
     console.error('[gateway/_mock] 异常:', err);
-    sendError(res, 500, 'MOCK_ERROR', { message: String(err?.message ?? err) });
+    const message = err instanceof Error ? err.message : String(err);
+    sendError(res, 500, 'MOCK_ERROR', { message });
   }
   return true;
 }

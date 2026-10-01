@@ -3,10 +3,11 @@
 // 切片 5 会用完整实现替换本文件（/agent/turn、/agent/audit，以及全部"坏行为"开关）。
 // 现在只提供一个存活探针，让 docker-compose 能整体起来、端口能通。
 import { createServer } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 
-const port = Number(process.env.PORT ?? 3200);
+const port = Number(process.env['PORT'] ?? 3200);
 
-const server = createServer((req, res) => {
+const server = createServer((req: IncomingMessage, res: ServerResponse) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, service: 'agent-mock', placeholder: true }));

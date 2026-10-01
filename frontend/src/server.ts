@@ -3,8 +3,9 @@
 // 切片 5 会替换为 React 18 + TypeScript + Vite 的真实前端（5 个页面）。
 // 现在只提供一个静态页面，让 docker-compose 能整体起来、端口能通。
 import { createServer } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 
-const port = Number(process.env.PORT ?? 5173);
+const port = Number(process.env['PORT'] ?? 5173);
 
 const PAGE = `<!doctype html>
 <html lang="zh-CN">
@@ -19,7 +20,7 @@ const PAGE = `<!doctype html>
 </body>
 </html>`;
 
-const server = createServer((req, res) => {
+const server = createServer((req: IncomingMessage, res: ServerResponse) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, service: 'frontend', placeholder: true }));
