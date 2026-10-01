@@ -73,6 +73,8 @@ export interface Group {
   readonly ownerPlatformUserId: string;
   readonly members: Map<string, Member>;
   writeForbidden: boolean;
+  /** 是否已解散（/_mock/groups/:id/dissolve）。解散即不可写，条目保留以返回确定性错误码。 */
+  dissolved: boolean;
   readonly invites: Map<string, Invite>;
   /** 尚未触发的 member_joined 定时器，reset 时要清掉。 */
   readonly joinTimers: Set<NodeJS.Timeout>;

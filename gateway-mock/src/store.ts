@@ -267,6 +267,7 @@ export function createGroup(creatorAccountId: string): { groupId: string } {
     ownerPlatformUserId,
     members: new Map([[ownerPlatformUserId, { platformUserId: ownerPlatformUserId, accountId: creatorAccountId, role: 'owner' }]]),
     writeForbidden: false,
+    dissolved: false,
     invites: new Map(),
     joinTimers: new Set(),
     joined: true,
@@ -558,11 +559,34 @@ export async function acceptSend(
   if (acceptedDelay > 0) await sleep(acceptedDelay);
 
   const deliveryDelay = randBetween(timing().messageSentDelayMin, timing().messageSentDelayMax);
-  setTimeout(() => {
-    if (shouldFail) {
+  if (shouldFail) {
+    setTimeout(() => {
       publish('message_failed', { clientMsgId, code: failCode });
-      return;
-    }
+    }, deliveryDelay);
+    return { accepted: true };
+  }
+
+  landMessage(groupId, accountId, clientMsgId, text, { delayMs: deliveryDelay });
+  return { accepted: true };
+}
+
+/**
+ * 让一条消息在网关侧"落地"：写消息记录（含 clientMsgId 索引）→ 推 message_sent
+ * → 再把该消息作为 message 事件回流。
+ *
+ * 两个调用方共用，保证语义一致：
+ *  - acceptSend：正常受理后按 deliveryDelay 落地；
+ *  - 504 故障（landAfterMs）：网关对 send 回了 504，但消息其实被接收，
+ *    按题面"2 秒内落地并推 message_sent"补落地。
+ */
+export function landMessage(
+  groupId: string,
+  accountId: string,
+  clientMsgId: string,
+  text: string,
+  { delayMs = 0 }: { delayMs?: number } = {}
+): void {
+  setTimeout(() => {
     const sentAt = new Date().toISOString(); // 毫秒精度
     const msgId = recordMessage({
       groupId,
@@ -583,9 +607,7 @@ export async function acceptSend(
         sentAt,
       });
     }, 1);
-  }, deliveryDelay);
-
-  return { accepted: true };
+  }, delayMs);
 }
 
 function findPlatformUserId(accountId: string): string | null {
@@ -663,6 +685,25 @@ export function setWriteForbidden(groupId: string, on: boolean): { writeForbidde
   return { writeForbidden: group.writeForbidden };
 }
 
+/**
+ * 解散群（`/_mock/groups/:id/dissolve`）。
+ *
+ * 题面把"群被解散"与"被禁言"统一为 403 GROUP_WRITE_FORBIDDEN，因此解散后：
+ *  - dissolved=true 供测试断言区分；
+ *  - writeForbidden=true，send/join 等写操作立即得到 403；
+ *  - 成员列表保留（题面未规定解散要推 member_left，不造额外事件）；
+ *  - 尚未触发的入群定时器作废，避免解散后又有人"加入"。
+ */
+export function dissolveGroup(groupId: string): { dissolved: true } {
+  const group = groups.get(groupId);
+  if (group === undefined) throw new GatewayError(404, 'GROUP_NOT_FOUND');
+  group.dissolved = true;
+  group.writeForbidden = true;
+  for (const timer of group.joinTimers) clearTimeout(timer);
+  group.joinTimers.clear();
+  return { dissolved: true };
+}
+
 /** 让群主退群（用于制造 409 OWNER_LEFT 场景）。 */
 export function ownerLeave(groupId: string): { left: true } {
   const group = groups.get(groupId);
@@ -689,6 +730,7 @@ export function dumpState(): {
     creatorAccountId: string;
     ownerPlatformUserId: string;
     writeForbidden: boolean;
+    dissolved: boolean;
     members: Array<{ platformUserId: string; accountId: string | null; role: MemberRole }>;
   }>;
   messages: MessageRecord[];
@@ -707,6 +749,7 @@ export function dumpState(): {
       creatorAccountId: g.creatorAccountId,
       ownerPlatformUserId: g.ownerPlatformUserId,
       writeForbidden: g.writeForbidden,
+      dissolved: g.dissolved,
       members: [...g.members.values()].map((m) => ({ platformUserId: m.platformUserId, accountId: m.accountId, role: m.role })),
     })),
     messages: [...messages.values()],

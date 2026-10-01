@@ -27,12 +27,14 @@ import {
   listMembers,
   assertCanSend,
   acceptSend,
+  landMessage,
   findByClientMsgId,
   consumeKickTimeout,
   sleep,
 } from './store.js';
 import { randBetween, timing } from './lib/timing.js';
 import { sendError, sendJson, readJsonBody, openEventStream } from './lib/http.js';
+import { consumeFault } from './lib/faults.js';
 import * as bus from './lib/event-bus.js';
 
 /**
@@ -149,10 +151,26 @@ export async function handle(req: IncomingMessage, res: ServerResponse, url: URL
     const groupId = decodeURIComponent(m[1]!);
     return handled(res, async () => {
       const body = await readJsonBody(req);
+      const accountId = body['accountId'] as string;
+      const clientMsgId = body['clientMsgId'] as string;
+      const text = body['text'] as string;
+
+      // 504 故障（HTTP 守卫把 send 的 504 留到这里消耗，因为需要请求体）。
+      // landAfterMs>0 时模拟"网关其实接收了消息"：先回 504，稍后落地并推
+      // message_sent（题面：2 秒内收敛）；landAfterMs=0 表示真的没收到，
+      // by-client-id 将持续 404。
+      const fault = consumeFault('send');
+      if (fault !== null && fault.mode === '504') {
+        if (fault.landAfterMs > 0) {
+          landMessage(groupId, accountId, clientMsgId, text, { delayMs: fault.landAfterMs });
+        }
+        throw new GatewayError(504, 'NETWORK_TIMEOUT');
+      }
+
       // 前置校验（离线/限流/不在群/群不可写）都在这里抛出同步错误
-      assertCanSend(groupId, body['accountId'] as string);
+      assertCanSend(groupId, accountId);
       // 校验通过后仍要延迟才返回 202，并异步推 message_sent / message_failed
-      await acceptSend(groupId, body['accountId'] as string, body['clientMsgId'] as string, body['text'] as string);
+      await acceptSend(groupId, accountId, clientMsgId, text);
       return { accepted: true as const };
     }, 202);
   }

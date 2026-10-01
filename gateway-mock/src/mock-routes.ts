@@ -18,6 +18,7 @@ import {
   resetState,
   setRateLimit,
   setWriteForbidden,
+  dissolveGroup,
   armKickTimeout,
   reinjectMessages,
   seedAccounts,
@@ -26,6 +27,7 @@ import {
 import { sendError, sendJson, readJsonBody, activeConnectionCount } from './lib/http.js';
 import * as bus from './lib/event-bus.js';
 import { setTimingProfile, TIMING_PROFILES, currentTimingProfile } from './lib/timing.js';
+import { setFault, clearFault, resetFaults, listFaults } from './lib/faults.js';
 import { config } from './config.js';
 import type { ReinjectEntry } from './types.js';
 
@@ -44,6 +46,7 @@ export async function handle(req: IncomingMessage, res: ServerResponse, url: URL
       lastEventId: bus.lastEventId(),
       delivery: bus.deliveryFlags(),
       behavior: { ...behavior },
+      faults: listFaults(),
       timingProfile: currentTimingProfile(),
       sseConnections: activeConnectionCount(),
     });
@@ -120,6 +123,12 @@ export async function handle(req: IncomingMessage, res: ServerResponse, url: URL
     });
   }
 
+  m = /^\/_mock\/groups\/([^/]+)\/dissolve$/.exec(path);
+  if (m) {
+    const groupId = decodeURIComponent(m[1]!);
+    return wrap(res, async () => dissolveGroup(groupId));
+  }
+
   m = /^\/_mock\/groups\/([^/]+)\/owner-leave$/.exec(path);
   if (m) {
     const groupId = decodeURIComponent(m[1]!);
@@ -185,6 +194,41 @@ export async function handle(req: IncomingMessage, res: ServerResponse, url: URL
     });
   }
 
+  // --- 通用故障注入 ---
+  // 支持三种写法：
+  //   { endpoint, mode, ... }              安装/更新一条规则（mode='off' 等同清除）
+  //   { clear: '<endpoint>' }              清除单条
+  //   { clearAll: true }                   清空全部
+  if (path === '/_mock/faults') {
+    try {
+      const body = await readJsonBody(req);
+      if (body['clearAll'] === true) {
+        resetFaults();
+        sendJson(res, 200, { ok: true, faults: listFaults() });
+        return true;
+      }
+      if (typeof body['clear'] === 'string') {
+        clearFault(body['clear']);
+        sendJson(res, 200, { ok: true, faults: listFaults() });
+        return true;
+      }
+      const rule = setFault({
+        endpoint: body['endpoint'] as string,
+        mode: body['mode'] as string,
+        persist: body['persist'] as boolean | undefined,
+        count: body['count'] as number | undefined,
+        probability: body['probability'] as number | undefined,
+        delayMs: body['delayMs'] as number | undefined,
+        landAfterMs: body['landAfterMs'] as number | undefined,
+      });
+      sendJson(res, 200, { ok: true, rule, faults: listFaults() });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      sendError(res, 400, 'BAD_REQUEST', { message });
+    }
+    return true;
+  }
+
   // --- 行为开关 ---
   if (path === '/_mock/behavior') {
     return wrap(res, async () => {
@@ -220,6 +264,7 @@ export async function handle(req: IncomingMessage, res: ServerResponse, url: URL
     return wrap(res, async () => {
       const body = await readJsonBody(req);
       resetState();
+      resetFaults(); // 故障规则与业务状态一起回到"全部默认关闭"
       // 默认不清零 eventId 计数器（与使用方确认过的决定）：
       // eventId 的全局单调性是网关对外契约，清零会让 since 补拉语义难以验证。
       bus.resetEventBus({ resetCounter: body['resetEventCounter'] === true });
