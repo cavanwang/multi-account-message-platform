@@ -141,3 +141,62 @@ export class HttpSendGateway implements SendGateway {
     return { kind: 'error', status: res.status, code, extra };
   }
 }
+
+/**
+ * by-client-id 查询接口（504 收敛用，规划 03 §2.3）。
+ * 返回消息是否已被网关持久化。
+ */
+export interface QueryGateway {
+  byClientId(
+    gatewayGroupId: string,
+    clientMsgId: string,
+  ): Promise<ByClientIdResult>;
+}
+
+export type ByClientIdResult =
+  | { kind: 'found'; msgId: string; sentAt: string }
+  | { kind: 'notFound' }
+  | { kind: 'unavailable' };
+
+/** HTTP 实现：GET /groups/:gid/messages/by-client-id/:cmid */
+export class HttpQueryGateway implements QueryGateway {
+  constructor(
+    private readonly gatewayUrl: string,
+    private readonly log: LoggerLike,
+  ) {}
+
+  async byClientId(
+    gatewayGroupId: string,
+    clientMsgId: string,
+  ): Promise<ByClientIdResult> {
+    const url = `${this.gatewayUrl}/groups/${encodeURIComponent(gatewayGroupId)}/messages/by-client-id/${encodeURIComponent(clientMsgId)}`;
+    const logCtx = { clientMsgId, gatewayGroupId };
+
+    let res: Response;
+    try {
+      res = await fetch(url);
+    } catch (netErr) {
+      this.log.warn(
+        { ...logCtx, err: netErr instanceof Error ? netErr.message : String(netErr) },
+        'gateway: by-client-id 网络异常，视为不可用',
+      );
+      return { kind: 'unavailable' };
+    }
+
+    if (res.status === 200) {
+      const body = (await res.json()) as { msgId: string; sentAt: string };
+      this.log.debug({ ...logCtx, msgId: body.msgId }, 'gateway: by-client-id 找到');
+      return { kind: 'found', msgId: body.msgId, sentAt: body.sentAt };
+    }
+    if (res.status === 404) {
+      this.log.debug(logCtx, 'gateway: by-client-id 未找到');
+      return { kind: 'notFound' };
+    }
+    // 5xx / 其他：视为不可用
+    this.log.warn(
+      { ...logCtx, gatewayStatus: res.status },
+      'gateway: by-client-id 不可用',
+    );
+    return { kind: 'unavailable' };
+  }
+}

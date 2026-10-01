@@ -239,4 +239,22 @@ export class OutboxRepo {
     );
     return rows[0] !== undefined ? fromDb(rows[0]) : undefined;
   }
+
+  /**
+   * 504 收敛重发前置（任务 3.6）：resend_count + generation 先于 HTTP 落库。
+   * 仅当行仍为 unknown 且未重发过时生效；返回新版本号，失败返回 null。
+   */
+  async prepareResend(outboxId: string, expectedVersion: number): Promise<number | null> {
+    const { rows } = await this.pool.query<{ version: number }>(
+      `UPDATE outbox_messages
+       SET resend_count = resend_count + 1,
+           generation = generation + 1,
+           version = version + 1,
+           updated_at = now()
+       WHERE id = $1 AND version = $2 AND delivery_status = 'unknown' AND resend_count = 0
+       RETURNING version`,
+      [outboxId, expectedVersion],
+    );
+    return rows[0]?.version ?? null;
+  }
 }

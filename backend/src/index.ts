@@ -15,7 +15,8 @@ import { assertSchemaUpToDate, SchemaVersionError } from './db/migrate.js';
 import { buildServer } from './http/server.js';
 import { RateLimitSweeper } from './workers/rate-limit-sweeper.js';
 import { OutboxSender } from './workers/outbox-sender.js';
-import { HttpSendGateway } from './services/gateway-client.js';
+import { Reconcile504Worker } from './workers/reconcile-504.js';
+import { HttpSendGateway, HttpQueryGateway } from './services/gateway-client.js';
 
 async function main(): Promise<void> {
   let config: AppConfig;
@@ -65,6 +66,20 @@ async function main(): Promise<void> {
   );
   outboxSender.start();
 
+  // 后台 worker：504 收敛（by-client-id 查询 → 定态或重发一次）
+  const queryGateway = new HttpQueryGateway(
+    config.gatewayUrl,
+    app.log.child({ component: 'gateway-query' }),
+  );
+  const reconcileWorker = new Reconcile504Worker(
+    pool,
+    queryGateway,
+    gatewaySender,
+    app.log.child({ worker: 'reconcile-504' }),
+    { batchSize: 10, intervalMs: 1000, backoffBaseMs: 500, maxBackoffMs: 5000, maxAttempts: 20 },
+  );
+  reconcileWorker.start();
+
   // --- 优雅退出 ---
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -74,6 +89,7 @@ async function main(): Promise<void> {
     try {
       rateLimitSweeper.stop();
       outboxSender.stop();
+      reconcileWorker.stop();
       await app.close();
       await closePool();
       process.exit(0);

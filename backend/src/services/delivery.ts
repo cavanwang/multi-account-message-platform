@@ -342,4 +342,137 @@ export class DeliveryService {
       client.release();
     }
   }
+
+  /**
+   * 504 收敛：by-client-id 确认已发出 → unknown → accepted + 回填 gateway_msg_id。
+   * CAS 条件带 version 与 delivery_status='unknown'，并发冲突静默跳过。
+   */
+  async markReconciledAccepted(
+    row: Pick<OutboxRow, 'id' | 'version' | 'clientMsgId' | 'groupId'>,
+    gatewayMsgId: string,
+  ): Promise<boolean> {
+    const client: PoolClient = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rowCount } = await client.query(
+        `UPDATE outbox_messages
+         SET delivery_status = 'accepted',
+             gateway_msg_id = $3,
+             accepted_at = now(),
+             version = version + 1,
+             updated_at = now()
+         WHERE id = $1 AND version = $2 AND delivery_status = 'unknown'`,
+        [row.id, row.version, gatewayMsgId],
+      );
+      if ((rowCount ?? 0) === 0) {
+        await client.query('ROLLBACK');
+        this.log.warn({ outboxId: row.id }, 'delivery: CAS 冲突，跳过 reconciled accepted');
+        return false;
+      }
+      await enqueueWebEvent(client, 'message_accepted', {
+        clientMsgId: row.clientMsgId,
+        groupId: row.groupId,
+        source: 'reconcile_504',
+      });
+      await client.query('COMMIT');
+      this.log.info(
+        { outboxId: row.id, clientMsgId: row.clientMsgId, gatewayMsgId },
+        'delivery: 504 收敛 → accepted',
+      );
+      return true;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * 504 收敛：重发成功 → unknown → accepted（CAS + web_event 同一事务，INV-5）。
+   * version 必须是 prepareResend 后的新版本。
+   */
+  async markResendAccepted(
+    row: Pick<OutboxRow, 'id' | 'clientMsgId' | 'groupId'>,
+    newVersion: number,
+  ): Promise<boolean> {
+    const client: PoolClient = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rowCount } = await client.query(
+        `UPDATE outbox_messages
+         SET delivery_status = 'accepted',
+             accepted_at = now(),
+             version = version + 1,
+             updated_at = now()
+         WHERE id = $1 AND version = $2 AND delivery_status = 'unknown'`,
+        [row.id, newVersion],
+      );
+      if ((rowCount ?? 0) === 0) {
+        await client.query('ROLLBACK');
+        this.log.warn({ outboxId: row.id }, 'delivery: CAS 冲突，跳过 resend accepted');
+        return false;
+      }
+      await enqueueWebEvent(client, 'message_accepted', {
+        clientMsgId: row.clientMsgId,
+        groupId: row.groupId,
+        source: 'reconcile_504_resend',
+      });
+      await client.query('COMMIT');
+      this.log.info(
+        { outboxId: row.id, clientMsgId: row.clientMsgId },
+        'delivery: 504 重发成功 → accepted',
+      );
+      return true;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * 504 收敛：确认未发出且重发失败/已重发过 → unknown → failed(NETWORK_TIMEOUT)。
+   */
+  async markReconciledFailed(
+    row: Pick<OutboxRow, 'id' | 'version' | 'clientMsgId' | 'groupId'>,
+    reason: string,
+  ): Promise<boolean> {
+    const client: PoolClient = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rowCount } = await client.query(
+        `UPDATE outbox_messages
+         SET delivery_status = 'failed',
+             fail_code = 'NETWORK_TIMEOUT',
+             version = version + 1,
+             updated_at = now()
+         WHERE id = $1 AND version = $2 AND delivery_status = 'unknown'`,
+        [row.id, row.version],
+      );
+      if ((rowCount ?? 0) === 0) {
+        await client.query('ROLLBACK');
+        this.log.warn({ outboxId: row.id }, 'delivery: CAS 冲突，跳过 reconciled failed');
+        return false;
+      }
+      await enqueueWebEvent(client, 'message_failed', {
+        clientMsgId: row.clientMsgId,
+        groupId: row.groupId,
+        failCode: 'NETWORK_TIMEOUT',
+        reason,
+      });
+      await client.query('COMMIT');
+      this.log.info(
+        { outboxId: row.id, clientMsgId: row.clientMsgId, reason },
+        'delivery: 504 收敛 → failed',
+      );
+      return true;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
 }
