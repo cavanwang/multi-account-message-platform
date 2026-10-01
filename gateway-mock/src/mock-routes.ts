@@ -27,7 +27,7 @@ import { sendError, sendJson, readJsonBody, activeConnectionCount } from './lib/
 import * as bus from './lib/event-bus.js';
 import { setTimingProfile, TIMING_PROFILES, currentTimingProfile } from './lib/timing.js';
 import { config } from './config.js';
-import type { ReinjectEntry, AccountStatus } from './types.js';
+import type { ReinjectEntry } from './types.js';
 
 /**
  * 处理一个控制请求。
@@ -61,12 +61,13 @@ export async function handle(req: IncomingMessage, res: ServerResponse, url: URL
   let m = /^\/_mock\/accounts\/([^/]+)\/(suspend|session-expire)$/.exec(path);
   if (m) {
     const accountId = decodeURIComponent(m[1]!);
-    const to = m[2] === 'suspend' ? 'suspended' : 'session_expired';
+    const to: 'suspended' | 'session_expired' =
+      m[2] === 'suspend' ? 'suspended' : 'session_expired';
     return wrap(res, async () => {
       const body = await readJsonBody(req);
       // 题面说 account_status 事件是"可能（不保证）"推送的，所以做成开关
       const pushAccountStatus = body['pushAccountStatus'] !== false;
-      markAccountTerminal(accountId, to as AccountStatus, { pushAccountStatus });
+      markAccountTerminal(accountId, to, { pushAccountStatus });
       return { ok: true, accountId, status: to, pushedAccountStatus: pushAccountStatus };
     });
   }

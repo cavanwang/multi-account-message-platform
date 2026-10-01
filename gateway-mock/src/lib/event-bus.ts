@@ -37,12 +37,14 @@ emitter.setMaxListeners(0); // 客户端数量不设上限
  * @returns 完整事件对象
  */
 export function publish<K extends GatewayEventType>(type: K, data: EventBody<K>): GatewayEvent {
-  // 注意展开顺序：eventId 与 type 放最后，保证调用方传入的同名键无法覆盖权威值
+  // 注意展开顺序：eventId 与 type 放最后，保证调用方传入的同名键无法覆盖权威值。
+  // EventBody<K> 与判别联合成员的对应关系无法在类型层面逐个表达，
+  // 这里 eventId/type 由本函数权威赋值，整体构造必然满足 GatewayEvent，故经 unknown 收窄。
   const event = {
     ...data,
     eventId: nextEventId++,
     type,
-  } as GatewayEvent;
+  } as unknown as GatewayEvent;
   history.push(event);
 
   scheduleDelivery(event);
@@ -59,7 +61,10 @@ export function publish<K extends GatewayEventType>(type: K, data: EventBody<K>)
  * 两种模式可以叠加。关闭时走直通路径，零延迟。
  */
 function scheduleDelivery(event: GatewayEvent): void {
-  const push = (): void => emitter.emit('event', event);
+  // 显式 void 函数体：emitter.emit 返回 boolean，不能作为 () => void 的返回值
+  const push = (): void => {
+    emitter.emit('event', event);
+  };
 
   if (delivery.shuffleMode) {
     const window = Math.min(timing().shuffleWindowMax, 50);

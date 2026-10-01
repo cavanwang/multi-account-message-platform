@@ -53,14 +53,17 @@ export async function handle(req: IncomingMessage, res: ServerResponse, url: URL
   }
 
   // --- 账号 ---
+  // 路径参数必须在闭包外提取：TS 不会在异步闭包内保留对正则匹配结果 m 的非空收窄。
   let m = /^\/accounts\/([^/]+)\/connect$/.exec(path);
   if (m && method === 'POST') {
-    return handled(res, () => connectAccount(decodeURIComponent(m[1])));
+    const accountId = decodeURIComponent(m[1]!);
+    return handled(res, () => connectAccount(accountId));
   }
 
   m = /^\/accounts\/([^/]+)\/disconnect$/.exec(path);
   if (m && method === 'POST') {
-    return handled(res, () => disconnectAccount(decodeURIComponent(m[1])));
+    const accountId = decodeURIComponent(m[1]!);
+    return handled(res, () => disconnectAccount(accountId));
   }
 
   // --- 建群 ---
@@ -73,21 +76,27 @@ export async function handle(req: IncomingMessage, res: ServerResponse, url: URL
 
   m = /^\/groups\/([^/]+)\/invite$/.exec(path);
   if (m && method === 'POST') {
+    const groupId = decodeURIComponent(m[1]!);
     return handled(res, async () => {
       const body = await readJsonBody(req);
-      // 允许调用方指定 readyAfterMs / 链接 TTL（测试用）；不传则由模拟器随机决定
-      return createInvite(decodeURIComponent(m[1]), {
-        readyAfterMs: body['readyAfterMs'] as number | undefined,
-        ttlMs: body['ttlMs'] as number | undefined,
-      });
+      // 允许调用方指定 readyAfterMs / 链接 TTL（测试用）；不传则由模拟器随机决定。
+      // exactOptionalPropertyTypes 下不能显式传 undefined，按字段是否存在逐个挂入。
+      const options: { readyAfterMs?: number; ttlMs?: number } = {};
+      if (typeof body['readyAfterMs'] === 'number') {
+        options.readyAfterMs = body['readyAfterMs'];
+      }
+      if (typeof body['ttlMs'] === 'number') {
+        options.ttlMs = body['ttlMs'];
+      }
+      return createInvite(groupId, options);
     });
   }
 
   m = /^\/groups\/([^/]+)\/join$/.exec(path);
   if (m && method === 'POST') {
+    const groupId = decodeURIComponent(m[1]!);
     return handled(res, async () => {
       const body = await readJsonBody(req);
-      const groupId = decodeURIComponent(m[1]);
       joinGroup(groupId, body['accountId'] as string, body['inviteLink'] as string);
       return { accepted: true as const };
     }, 202);
@@ -95,15 +104,16 @@ export async function handle(req: IncomingMessage, res: ServerResponse, url: URL
 
   m = /^\/groups\/([^/]+)\/promote$/.exec(path);
   if (m && method === 'POST') {
+    const groupId = decodeURIComponent(m[1]!);
     return handled(res, async () => {
       const body = await readJsonBody(req);
-      return promoteMember(decodeURIComponent(m[1]), body['byAccountId'] as string, body['accountId'] as string);
+      return promoteMember(groupId, body['byAccountId'] as string, body['accountId'] as string);
     });
   }
 
   m = /^\/groups\/([^/]+)\/kick$/.exec(path);
   if (m && method === 'POST') {
-    const groupId = decodeURIComponent(m[1]);
+    const groupId = decodeURIComponent(m[1]!);
     return handled(res, async () => {
       const body = await readJsonBody(req);
       // 一次性故障：下一次 kick 返回 504 NETWORK_TIMEOUT（结果未知）
@@ -120,21 +130,23 @@ export async function handle(req: IncomingMessage, res: ServerResponse, url: URL
 
   m = /^\/groups\/([^/]+)\/leave$/.exec(path);
   if (m && method === 'POST') {
+    const groupId = decodeURIComponent(m[1]!);
     return handled(res, async () => {
       const body = await readJsonBody(req);
-      return leaveGroup(decodeURIComponent(m[1]), body['accountId'] as string);
+      return leaveGroup(groupId, body['accountId'] as string);
     });
   }
 
   m = /^\/groups\/([^/]+)\/members$/.exec(path);
   if (m && method === 'GET') {
-    return handled(res, () => listMembers(decodeURIComponent(m[1])));
+    const groupId = decodeURIComponent(m[1]!);
+    return handled(res, () => listMembers(groupId));
   }
 
   // --- 发消息 ---
   m = /^\/groups\/([^/]+)\/send$/.exec(path);
   if (m && method === 'POST') {
-    const groupId = decodeURIComponent(m[1]);
+    const groupId = decodeURIComponent(m[1]!);
     return handled(res, async () => {
       const body = await readJsonBody(req);
       // 前置校验（离线/限流/不在群/群不可写）都在这里抛出同步错误
@@ -147,8 +159,10 @@ export async function handle(req: IncomingMessage, res: ServerResponse, url: URL
 
   m = /^\/groups\/([^/]+)\/messages\/by-client-id\/([^/]+)$/.exec(path);
   if (m && method === 'GET') {
+    const groupId = decodeURIComponent(m[1]!);
+    const clientMsgId = decodeURIComponent(m[2]!);
     return handled(res, () => {
-      const found = findByClientMsgId(decodeURIComponent(m[1]), decodeURIComponent(m[2]));
+      const found = findByClientMsgId(groupId, clientMsgId);
       if (found === null) {
         throw new GatewayError(404, 'NOT_FOUND');
       }

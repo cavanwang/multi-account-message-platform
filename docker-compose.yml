@@ -3,7 +3,7 @@
 # 服务一览
 #   db            PostgreSQL 16，带健康检查；数据存 named volume
 #   backend       后端 API；启动前自动执行 migration，schema 落后则拒绝启动
-#   gateway-mock  消息网关模拟器（切片 1 实现，当前为占位）
+#   gateway-mock  消息网关模拟器（切片 1 已实现）
 #   agent-mock    Agent 服务模拟器（切片 5 实现，当前为占位）
 #   frontend      控制台前端（切片 5 实现，当前为占位）
 #

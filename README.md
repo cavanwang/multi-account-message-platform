@@ -29,7 +29,7 @@ docker compose up --build
 |---|---|---|
 | 后端 API | http://localhost:3000 | |
 | PostgreSQL | localhost:5432 | 用户/口令/库名均为 `app` |
-| 消息网关模拟器 | http://localhost:3100 | 切片 1 实现，当前为占位 |
+| 消息网关模拟器 | http://localhost:3100 | 切片 1 已实现（正式路径 + `/_mock` 故障注入） |
 | Agent 模拟器 | http://localhost:3200 | 切片 5 实现，当前为占位 |
 | 前端控制台 | http://localhost:5173 | 切片 5 实现，当前为占位 |
 
@@ -46,9 +46,14 @@ curl -X POST http://localhost:3000/api/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"admin"}'
 
-# 受保护路由：带 token 可访问，viewer 的写操作返回 403 FORBIDDEN
-curl http://localhost:3000/api/_ping -H "Authorization: Bearer <accessToken>"
-curl -X POST http://localhost:3000/api/_ping -H "Authorization: Bearer <accessToken>"
+# 受保护路由：带 token 可访问账号列表
+curl http://localhost:3000/api/accounts -H "Authorization: Bearer <accessToken>"
+
+# viewer 只读：用 viewer 登录得到的 token 调写接口，返回 403 FORBIDDEN
+curl -X POST http://localhost:3000/api/accounts/acct-1/transition \
+  -H "Authorization: Bearer <viewerToken>" \
+  -H 'Content-Type: application/json' \
+  -d '{"to":"online","expectedFrom":"idle"}'
 ```
 
 ### 宿主机本地开发（不用容器跑后端）

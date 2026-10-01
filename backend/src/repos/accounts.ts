@@ -94,7 +94,11 @@ export class AccountRepo {
         expectedVersion,
       ],
     );
-    return rowCount === 0 ? null : fromDb(rows[0]);
+    // rowCount=0 表示 CAS 冲突或账号不存在；noUncheckedIndexedAccess 下
+    // rows[0] 类型为 DbAccountRow | undefined，需显式收窄后再转换
+    const updated = rows[0];
+    if (rowCount === 0 || updated === undefined) return null;
+    return fromDb(updated);
   }
 
   /**
