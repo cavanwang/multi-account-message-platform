@@ -32,6 +32,7 @@ import { SequenceRunnerWorker } from './workers/sequence-runner-worker.js';
 import { SequenceRepo } from './repos/sequences.js';
 import { mkdir } from 'node:fs/promises';
 import { MediaCleaner } from './workers/media-cleaner.js';
+import { installFetchTracing } from './services/trace.js';
 
 async function main(): Promise<void> {
   let config: AppConfig;
@@ -42,6 +43,10 @@ async function main(): Promise<void> {
     console.error(err instanceof Error ? err.message : err);
     process.exit(1);
   }
+
+  // 全链路追踪：仪表化全局 fetch（上下文内出站请求自动透传 x-request-id）。
+  // 必须早于任何 fetch 调用；幂等。
+  installFetchTracing();
 
   // schema 校验：不通过则明确拒绝启动
   try {

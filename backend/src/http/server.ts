@@ -19,6 +19,7 @@ import { registerAgentRunRoutes } from './routes/agent-runs.js';
 import { registerSequenceRoutes } from './routes/sequences.js';
 import { registerWsRoutes } from './routes/ws.js';
 import { WsHub } from '../services/ws-hub.js';
+import { enterTrace, pinoMixin, TRACE_HEADER } from '../services/trace.js';
 
 export interface ServerDeps {
   readonly config: AppConfig;
@@ -37,6 +38,8 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       // 输出 JSON，方便 docker logs 与采集。
       // 这里不设 transport（pino-pretty 需要额外依赖，且容器里 JSON 更实用）。
       level: config.logLevel,
+      // 每条日志自动合并当前 traceId（来自 AsyncLocalStorage，见 services/trace.ts）
+      mixin: pinoMixin,
     },
     // 对每个请求生成唯一 id，用于错误响应与日志关联；调用方自带 x-request-id 时沿用
     genReqId: (req) => {
@@ -100,6 +103,17 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       },
     };
     return reply.status(404).send(body);
+  });
+
+  // --- 请求入口：建立 trace 上下文 ---
+  // traceId 即 Fastify reqId（genReqId 已支持沿用入站 x-request-id）。
+  // 用 enterWith 让钩子之后的整条请求链路（preHandler / handler / 错误处理 /
+  // 响应完成日志）都处于同一 trace 上下文；同时在响应头回写，便于调用方关联。
+  app.addHook('onRequest', (request, reply, done) => {
+    const traceId = String(request.id);
+    reply.header(TRACE_HEADER, traceId);
+    enterTrace(traceId);
+    done();
   });
 
   // --- WebSocket 插件（必须在注册 WS 路由之前） ---

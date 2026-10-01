@@ -22,6 +22,7 @@ import {
   clearMessageLocalFile,
 } from '../repos/messages.js';
 import type { LoggerLike } from '../services/gateway-client.js';
+import { withNewTrace } from '../services/trace.js';
 
 export interface MediaCleanerResult {
   /** 实际删除（含文件已不在）并清空记录的数量 */
@@ -130,9 +131,10 @@ export class MediaCleaner {
 
   private async sweep(): Promise<void> {
     try {
-      const result = await cleanExpiredMedia(
+      // 每轮清理周期一个 trace：删除文件 / DB 清理 / 保护跳过日志共用 traceId
+      const result = await withNewTrace(() => cleanExpiredMedia(
         this.pool, this.agentRunRepo, this.mediaDir, this.retentionDays, this.log,
-      );
+      ));
       if (result.deleted > 0 || result.protected > 0) {
         this.log.info(result, 'media-cleaner: 本轮清理完成');
       }

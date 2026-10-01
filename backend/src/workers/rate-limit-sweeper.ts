@@ -12,6 +12,7 @@
  * 到期时若账号已不是 rate_limited（WHERE 条件不匹配）自然不会被恢复。
  */
 import type { Pool } from 'pg';
+import { withNewTrace } from '../services/trace.js';
 
 export interface RateLimitSweeperOptions {
   /** 扫描间隔（毫秒），默认 1000。 */
@@ -76,16 +77,16 @@ export class RateLimitSweeper {
   }
 
   private async sweep(): Promise<void> {
-    try {
+    // 每轮扫描一个 trace：恢复回调（WS 推送等）链路日志归入该 traceId
+    await withNewTrace(async () => {
       const { rows } = await this.pool.query<{ account_id: string }>(SWEEP_SQL);
       for (const row of rows) {
         this.options.onRecover?.(row.account_id);
       }
-    } catch (err) {
+    }).catch((err) => {
       // 记录错误但不中断 worker：下一轮扫描会重试，到期恢复天然幂等
       console.error('[RateLimitSweeper] sweep 失败:', err);
-    } finally {
-      this.scheduleNext();
-    }
+    });
+    this.scheduleNext();
   }
 }

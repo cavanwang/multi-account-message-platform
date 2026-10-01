@@ -17,10 +17,12 @@
  * gatewayStatus, gatewayCode }，批次摘要带 { claimed, sent, skipped, failed }。
  */
 import type { Pool } from 'pg';
+import { randomUUID } from 'node:crypto';
 import { OutboxRepo, type ClaimedRow } from '../repos/outbox.js';
 import type { SendGateway, SendResult } from '../services/gateway-client.js';
 import type { LoggerLike } from '../services/gateway-client.js';
 import { DeliveryService } from '../services/delivery.js';
+import { enterTrace, exitTrace } from '../services/trace.js';
 
 export interface OutboxSenderOptions {
   /** 每批最多取多少条，默认 10。 */
@@ -150,6 +152,9 @@ export class OutboxSender {
     const unreachableGroups = new Set<string>();
 
     for (const row of claimed) {
+      // 每条消息一个独立 trace：网关往返 + delivery 状态推进的日志共用 traceId。
+      // 循环体含 break，统一在循环后 exitTrace 收尾。
+      enterTrace(randomUUID());
       const logCtx = {
         clientMsgId: row.clientMsgId,
         outboxId: row.id,
@@ -260,6 +265,8 @@ export class OutboxSender {
       this.consecutiveGatewayFailures = 0;
     }
 
+    // 退出逐条 trace：批次摘要日志不应挂着最后一条消息的 traceId
+    exitTrace();
     this.log.info(stats, 'outbox-sender: 批处理完成');
   }
 }

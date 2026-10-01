@@ -28,6 +28,7 @@ import { enqueueWebEvent } from '../repos/web-events.js';
 import type { LoggerLike } from '../services/gateway-client.js';
 import { dispatch } from '../services/event-handlers/index.js';
 import type { HandlerContext, MediaConfig } from '../services/event-handlers/types.js';
+import { withNewTrace } from '../services/trace.js';
 
 /** C1 媒体默认配置（测试未显式传入时使用）。 */
 const DEFAULT_MEDIA_CONFIG: MediaConfig = {
@@ -159,7 +160,8 @@ export class EventConsumer {
         while ((sep = buffer.indexOf('\n\n')) >= 0) {
           const frame = buffer.slice(0, sep);
           buffer = buffer.slice(sep + 2);
-          await this.handleFrame(frame);
+          // 每帧一个独立 trace：覆盖「inbox 落库」这一事务的全部日志
+          await withNewTrace(() => this.handleFrame(frame));
         }
       }
       // 流正常结束
@@ -264,7 +266,8 @@ export class EventConsumer {
     let failed = 0;
 
     for (const row of rows) {
-      const success = await this.consumeOne(row);
+      // 每条事件一个独立 trace：handler 内的日志、出站调用都归入该 traceId
+      const success = await withNewTrace(() => this.consumeOne(row));
       if (success) ok++;
       else failed++;
     }

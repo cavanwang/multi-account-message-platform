@@ -26,6 +26,7 @@ import { JobRepo, type JobRow } from '../repos/jobs.js';
 import { GroupRepo } from '../repos/groups.js';
 import { AccountRepo } from '../repos/accounts.js';
 import type { GroupGateway, LoggerLike } from '../services/gateway-client.js';
+import { withNewTrace } from '../services/trace.js';
 
 /**
  * 每个账号 leave 遇 500 INTERNAL_ERROR 的最大重试次数。
@@ -104,8 +105,11 @@ export class LeaveAllJobWorker {
       }
 
       try {
-        await this.stepLeaveNonOwners(client, job);
-        await this.stepLeaveOwner(client, job);
+        // 一次 tick 内该 job 的全部退群往返与事务共用同一 traceId
+        await withNewTrace(async () => {
+          await this.stepLeaveNonOwners(client, job);
+          await this.stepLeaveOwner(client, job);
+        });
       } finally {
         await client.query('SELECT pg_advisory_unlock(hashtext($1))', [job.id]);
       }

@@ -9,6 +9,7 @@ import type { LoggerLike } from '../services/gateway-client.js';
 import type { AgentRunnerDeps } from '../services/agent-runner.js';
 import { runAgent } from '../services/agent-runner.js';
 import type { AgentRunRepo } from '../repos/agent-runs.js';
+import { withNewTrace } from '../services/trace.js';
 
 export interface AgentRunnerWorkerOptions {
   /** 扫描间隔（毫秒），默认 200。 */
@@ -75,7 +76,9 @@ export class AgentRunnerWorker {
       );
       if (!rows[0]!.locked) return; // 其他实例正在执行
 
-      await runAgent(this.deps, runId);
+      // 单次 runAgent 执行（可能包含多轮 turn / audit / 工具调用）共用一个
+      // traceId；run 若跨 tick 恢复执行，每次 sweep 开启新 trace
+      await withNewTrace(() => runAgent(this.deps, runId));
     } catch (err) {
       this.deps.log.error({ runId, err }, '[AgentRunnerWorker] runAgent 失败');
     } finally {

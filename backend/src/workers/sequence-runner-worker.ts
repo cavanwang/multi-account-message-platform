@@ -12,6 +12,7 @@ import { SequenceRepo } from '../repos/sequences.js';
 import { executeDueStep, scheduleNextStep, type SequenceRunnerDeps } from '../services/sequence-runner.js';
 import type { LoggerLike } from '../services/gateway-client.js';
 import { enqueueWebEvent } from '../repos/web-events.js';
+import { withNewTrace } from '../services/trace.js';
 
 export class SequenceRunnerWorker {
   private running = false;
@@ -133,7 +134,8 @@ export class SequenceRunnerWorker {
       );
       if (rows[0]?.locked !== true) return;
       try {
-        await fn(client);
+        // 每个 run 每步每 tick 一个独立 trace（pending 执行 / accepted 检查通用）
+        await withNewTrace(() => fn(client));
       } finally {
         await client.query('SELECT pg_advisory_unlock(hashtext($1))', [runId]).catch(() => {});
       }

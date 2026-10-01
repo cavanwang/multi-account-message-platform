@@ -24,6 +24,7 @@ import { JobRepo, type JobRow } from '../repos/jobs.js';
 import { GroupRepo } from '../repos/groups.js';
 import { AccountRepo } from '../repos/accounts.js';
 import type { GroupGateway, LoggerLike } from '../services/gateway-client.js';
+import { withNewTrace } from '../services/trace.js';
 
 /** payload 中已持久化的邀请信息。 */
 interface InvitePayload {
@@ -105,10 +106,14 @@ export class GroupJobWorker {
       }
 
       try {
-        await this.stepCreate(client, job);
-        await this.stepInvite(client, job);
-        await this.stepJoin(client, job);
-        await this.stepPromote(client, job);
+        // 一次 tick 推进一个 job 的各步骤：同一 traceId 覆盖本轮全部
+        // 网关往返与事务日志（下一 tick 重新开启新 trace）
+        await withNewTrace(async () => {
+          await this.stepCreate(client, job);
+          await this.stepInvite(client, job);
+          await this.stepJoin(client, job);
+          await this.stepPromote(client, job);
+        });
       } finally {
         // advisory lock 随事务/连接释放
         await client.query('SELECT pg_advisory_unlock(hashtext($1))', [job.id]);

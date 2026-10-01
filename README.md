@@ -103,6 +103,14 @@ Agent 的对话块（`agent_run_messages`）、每一步（`agent_steps`）、�
 | `FOR UPDATE SKIP LOCKED` | outbox 消息的多实例工作认领 |
 | 聚合根 `version` + CAS UPDATE | accounts/groups/outbox/run 的并发变更，后写不覆盖先写，冲突方可重试或跳过 |
 
+### 可观测性：分级日志与全链路 traceId
+
+- **分级结构化日志**：基于 pino 输出 JSON，级别由 `LOG_LEVEL` 控制；预期内业务错误记 `warn`、未预期异常记 `error`（带堆栈），worker 以 child logger 绑定 `worker` 名与业务实体 ID。
+- **traceId 全链路**：基于 `AsyncLocalStorage`（[trace.ts](file:///home/ubuntu/multi-account-message-platform/backend/src/services/trace.ts)），业务代码零侵入——
+  - HTTP 入口以 reqId 为 traceId（沿用入站 `x-request-id`，响应头回写）；worker 每条事件/消息/job tick/序列步/Agent 执行各开启独立 traceId；
+  - 每条日志经 pino `mixin` 自动带 `traceId` 字段；进程启动时仪表化全局 `fetch`，上下文内所有出站调用（网关 / Agent）自动透传 `x-request-id`，可按同一 ID 反查整条链路。
+- 边界：请求「受理 → worker 异步处理」之间为不同 traceId（仍可凭 `clientMsgId` 等实体 ID 关联）。
+
 ### 需求关注点实现对照
 
 题面 `docs/examination_project.md` 的关键关注点及其落点：

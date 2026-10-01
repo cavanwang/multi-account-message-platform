@@ -19,11 +19,13 @@
  * 日志：每个任务带 { clientMsgId, outboxId, taskId, attempts }，收敛决策与 HTTP 往返均有结构化日志。
  */
 import type { Pool } from 'pg';
+import { randomUUID } from 'node:crypto';
 import { OutboxRepo } from '../repos/outbox.js';
 import { ReconciliationRepo, type ReconTask } from '../repos/reconciliations.js';
 import type { SendGateway, QueryGateway } from '../services/gateway-client.js';
 import type { LoggerLike } from '../services/gateway-client.js';
 import { DeliveryService } from '../services/delivery.js';
+import { enterTrace, exitTrace } from '../services/trace.js';
 
 export interface ReconcileOptions {
   batchSize?: number;
@@ -109,6 +111,8 @@ export class Reconcile504Worker {
     let backoff = 0;
 
     for (const task of tasks) {
+      // 每个收敛任务一个独立 trace：by-client-id 查询 / 重发 / 状态推进共用 traceId
+      enterTrace(randomUUID());
       const logCtx = {
         taskId: task.taskId,
         clientMsgId: task.clientMsgId,
@@ -227,6 +231,8 @@ export class Reconcile504Worker {
       this.log.debug({ ...logCtx, delayMs: delay }, 'reconcile-504: 查询不可用，退避');
     }
 
+    // 退出逐任务 trace：批次摘要日志不带最后一个任务的 traceId
+    exitTrace();
     this.log.info({ processed, resolved, retried, backoff }, 'reconcile-504: 批处理完成');
   }
 }
