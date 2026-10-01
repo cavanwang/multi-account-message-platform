@@ -23,11 +23,19 @@ import { listTimeline } from '../repos/messages.js';
 import type { AccountRepo } from '../repos/accounts.js';
 import type { AgentClient, AgentContentBlock, AgentMessage, AgentTool, TurnResult } from './agent-client.js';
 import type { LoggerLike } from './gateway-client.js';
+import type { GroupGateway } from './gateway-client.js';
+import { enqueueWebEvent } from '../repos/web-events.js';
 
 /** Agent 客户端接口（便于 mock 测试）。 */
 export interface AgentClientLike {
   callTurn(runId: string, tools: AgentTool[], messages: AgentMessage[]): Promise<TurnResult>;
+  callAudit(text: string, groupId: string): Promise<AuditResultLike>;
 }
+
+export type AuditResultLike =
+  | { kind: 'pass' }
+  | { kind: 'fail'; reason: string }
+  | { kind: 'error'; message: string };
 
 /** 预算上限常量。 */
 const MAX_STEPS = 12;
@@ -75,6 +83,7 @@ export interface AgentRunnerDeps {
   readonly outboxRepo: OutboxRepo;
   readonly accountRepo: AccountRepo;
   readonly agentClient: AgentClientLike;
+  readonly groupGateway: GroupGateway;
   readonly log: LoggerLike;
 }
 
@@ -213,11 +222,23 @@ export async function runAgent(deps: AgentRunnerDeps, runId: string): Promise<vo
         // 持久化 assistant 的 tool_use 块
         await agentRunRepo.appendMessage(client, runId, 'assistant', [block]);
 
-        // 执行工具
-        const toolResult = await executeTool(deps, client, run, block);
+        // 执行工具（审计 3 次失败会抛 AuditBlockedError）
+        let toolResult: ToolExecutionResult;
+        try {
+          toolResult = await executeTool(deps, client, run, block);
+        } catch (err) {
+          if (err instanceof AuditBlockedError) {
+            // run → blocked，推事件通知操作员
+            await agentRunRepo.finishRun(client, runId, 'blocked', 'audit_blocked', null);
+            await enqueueWebEvent(client, 'agent_blocked', { runId, groupId: run.groupId, reason: 'audit_blocked' });
+            log.info({ runId }, 'agent: 审计连续失败，run blocked');
+            return;
+          }
+          throw err;
+        }
 
         // 第 1 类协议错误（UNKNOWN_TOOL / INVALID_INPUT）：正常追加 is_error tool_result
-        // 其他错误（NO_AVAILABLE_ACCOUNT 等）也以 is_error tool_result 返回
+        // 其他错误（NO_AVAILABLE_ACCOUNT / SEND_FAILED 等）也以 is_error tool_result 返回
         const isError = toolResult.isError;
         const resultContent = truncate(JSON.stringify(toolResult.content), MAX_TOOL_RESULT_BYTES);
         const toolResultBlock: AgentContentBlock = {
@@ -236,7 +257,7 @@ export async function runAgent(deps: AgentRunnerDeps, runId: string): Promise<vo
           resultSummary: truncate(resultContent, 200),
           isError,
           errorCode: toolResult.errorCode ?? null,
-          auditVerdict: null,
+          auditVerdict: toolResult.auditVerdict ?? null,
           rawResponse: null,
         });
 
@@ -273,6 +294,15 @@ interface ToolExecutionResult {
   readonly content: unknown;
   readonly isError: boolean;
   readonly errorCode?: string;
+  readonly auditVerdict?: string;
+}
+
+/** 审计连续 3 次失败 → run blocked。 */
+class AuditBlockedError extends Error {
+  constructor() {
+    super('audit_blocked');
+    this.name = 'AuditBlockedError';
+  }
 }
 
 /** 执行单个工具调用。 */
@@ -288,15 +318,35 @@ async function executeTool(
     case 'get_recent_messages':
       return execGetRecentMessages(deps, run.groupId, input);
     case 'send_message':
-      return execSendMessage(deps, client, run, input);
+      return execSendMessage(deps, client, run, block.id, input);
     case 'kick_user':
-      return { content: { error: 'POLICY_DENIED' }, isError: true, errorCode: 'POLICY_DENIED' };
+      return execKickUser(deps, client, run, block.id, input);
     case 'finish':
       return { content: { ok: true }, isError: false };
     default:
-      // 未知工具 → 第 1 类协议错误
       return { content: { error: 'UNKNOWN_TOOL' }, isError: true, errorCode: 'UNKNOWN_TOOL' };
   }
+}
+
+/**
+ * 审计：最多 3 次，每次间隔 1s。
+ * pass → 执行；fail → 返回 AUDIT_REJECTED；3 次 error → throw AuditBlockedError。
+ */
+async function runAudit(
+  deps: AgentRunnerDeps,
+  text: string,
+  groupId: string,
+): Promise<'pass' | 'fail'> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const result = await deps.agentClient.callAudit(text, groupId);
+    if (result.kind === 'pass') return 'pass';
+    if (result.kind === 'fail') return 'fail';
+    // error → 重试
+    if (attempt < 2) {
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+  throw new AuditBlockedError();
 }
 
 /** get_recent_messages：查 messages 表最近 limit 条。 */
@@ -318,11 +368,15 @@ async function execGetRecentMessages(
   };
 }
 
-/** send_message：选 online 账号入队 outbox。 */
+/**
+ * send_message：幂等键去重 → 审计 → 选 online 账号 → 入队 outbox。
+ * 被 AUDIT_REJECTED 拒绝的不占用幂等键。
+ */
 async function execSendMessage(
   deps: AgentRunnerDeps,
   client: PoolClient,
   run: { id: string; groupId: string },
+  toolUseId: string,
   input: Record<string, unknown>,
 ): Promise<ToolExecutionResult> {
   const text = typeof input['text'] === 'string' ? input['text'] : '';
@@ -332,25 +386,105 @@ async function execSendMessage(
     return { content: { error: 'INVALID_INPUT', reason: 'text 为空' }, isError: true, errorCode: 'INVALID_INPUT' };
   }
 
+  // 幂等键检查：同 run 同 key 已执行 → 返回当前状态，不审计不重发
+  const existing = await deps.agentRunRepo.getToolCall(client, run.id, idempotencyKey);
+  if (existing !== undefined && existing.state === 'executed' && existing.outboxId !== null) {
+    const { rows } = await client.query<{ delivery_status: string }>(
+      'SELECT delivery_status FROM outbox_messages WHERE id = $1',
+      [existing.outboxId],
+    );
+    const status = rows[0]?.delivery_status ?? 'unknown';
+    return { content: { status, clientMsgId: idempotencyKey, idempotent: true }, isError: false };
+  }
+
+  // 审计
+  const verdict = await runAudit(deps, text, run.groupId);
+  if (verdict === 'fail') {
+    // 被拒不占用幂等键（不 recordToolCall）
+    return { content: { error: 'AUDIT_REJECTED' }, isError: true, errorCode: 'AUDIT_REJECTED', auditVerdict: 'fail' };
+  }
+
   // 选群里第一个 online 账号
   const members = await deps.groupRepo.listMembers(run.groupId);
-  const accounts = await deps.accountRepo.findByAccountIds(members.map((m) => m.accountId));
+  const accounts = await deps.accountRepo.findByUuids(members.map((m) => m.accountId));
   const onlineAccount = accounts.find((a) => a.status === 'online');
   if (onlineAccount === undefined) {
     return { content: { error: 'NO_AVAILABLE_ACCOUNT' }, isError: true, errorCode: 'NO_AVAILABLE_ACCOUNT' };
   }
 
-  // 入队 outbox（origin='agent'）
-  const clientMsgId = idempotencyKey;
-  await deps.outboxRepo.enqueue(client, {
+  // 记录幂等键 → 入队 outbox → 标记已执行
+  await deps.agentRunRepo.recordToolCall(client, run.id, idempotencyKey, toolUseId);
+  const outbox = await deps.outboxRepo.enqueue(client, {
     groupId: run.groupId,
     accountId: onlineAccount.id,
-    clientMsgId,
+    clientMsgId: idempotencyKey,
     text,
     origin: 'agent',
   });
+  await deps.agentRunRepo.markToolCallExecuted(client, run.id, idempotencyKey, outbox.id);
 
-  return { content: { status: 'queued', clientMsgId }, isError: false };
+  return { content: { status: 'queued', clientMsgId: idempotencyKey }, isError: false, auditVerdict: 'pass' };
+}
+
+/**
+ * kick_user：autoKickEnabled 检查 → 选 creator/admin+online 账号 → 审计 → 调网关 kick。
+ */
+async function execKickUser(
+  deps: AgentRunnerDeps,
+  client: PoolClient,
+  run: { id: string; groupId: string },
+  toolUseId: string,
+  input: Record<string, unknown>,
+): Promise<ToolExecutionResult> {
+  const targetPlatformUserId = typeof input['platform_user_id'] === 'string' ? input['platform_user_id'] : '';
+  const reason = typeof input['reason'] === 'string' ? input['reason'] : '';
+
+  if (targetPlatformUserId === '') {
+    return { content: { error: 'INVALID_INPUT', reason: 'platform_user_id 为空' }, isError: true, errorCode: 'INVALID_INPUT' };
+  }
+
+  // 群策略检查
+  const group = await deps.groupRepo.findById(run.groupId);
+  if (group === undefined) {
+    return { content: { error: 'GROUP_NOT_FOUND' }, isError: true, errorCode: 'GROUP_NOT_FOUND' };
+  }
+  if (!group.autoKickEnabled) {
+    return { content: { error: 'POLICY_DENIED' }, isError: true, errorCode: 'POLICY_DENIED' };
+  }
+
+  // 审计（kick 的 text 为 JSON）
+  const auditText = JSON.stringify({ action: 'kick', platform_user_id: targetPlatformUserId, reason });
+  const verdict = await runAudit(deps, auditText, run.groupId);
+  if (verdict === 'fail') {
+    return { content: { error: 'AUDIT_REJECTED' }, isError: true, errorCode: 'AUDIT_REJECTED', auditVerdict: 'fail' };
+  }
+
+  // 选 creator/admin 且 online 的账号
+  const members = await deps.groupRepo.listMembers(run.groupId);
+  const eligibleMembers = members.filter((m) => m.role === 'creator' || m.role === 'admin');
+  const accounts = await deps.accountRepo.findByUuids(eligibleMembers.map((m) => m.accountId));
+  const onlineAccount = accounts.find((a) => a.status === 'online');
+  if (onlineAccount === undefined) {
+    return { content: { error: 'NO_AVAILABLE_ACCOUNT' }, isError: true, errorCode: 'NO_AVAILABLE_ACCOUNT' };
+  }
+
+  // 调网关 kick
+  const kickResult = await deps.groupGateway.kickMember(
+    group.gatewayGroupId,
+    onlineAccount.accountId,
+    targetPlatformUserId,
+  );
+
+  if (kickResult.kind === 'ok') {
+    return { content: { kicked: true }, isError: false, auditVerdict: 'pass' };
+  }
+  // 网络/业务错误 → SEND_FAILED（run 继续）
+  return {
+    content: { error: 'SEND_FAILED', code: kickResult.kind === 'error' ? kickResult.code : kickResult.code },
+    isError: true,
+    errorCode: 'SEND_FAILED',
+    auditVerdict: 'pass',
+  };
 }
 
 /** 截断字符串到 maxBytes 字节。 */

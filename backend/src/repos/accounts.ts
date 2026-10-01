@@ -66,6 +66,19 @@ export class AccountRepo {
   }
 
   /**
+   * 按内部 UUID 批量查询（agent runner：群成员存的是 accounts.id）。
+   * 返回顺序不保证与入参一致，调用方需自行归并。
+   */
+  async findByUuids(ids: readonly string[]): Promise<AccountRow[]> {
+    if (ids.length === 0) return [];
+    const { rows } = await this.pool.query<DbAccountRow>(
+      'SELECT * FROM accounts WHERE id = ANY($1)',
+      [ids as string[]],
+    );
+    return rows.map(fromDb);
+  }
+
+  /**
    * 按文本 account_id 批量查询（建群受理的成员校验，避免 N+1 往返）。
    * 返回顺序不保证与入参一致，调用方需自行按入参顺序归并。
    */

@@ -258,6 +258,56 @@ export class AgentRunRepo {
   async clearPendingMessages(client: PoolClient, runId: string): Promise<void> {
     await client.query('DELETE FROM agent_run_pending_messages WHERE run_id = $1', [runId]);
   }
+
+  // --- tool calls (幂等键) ---
+
+  /** 查同 run 同 idempotency_key 的工具调用记录。 */
+  async getToolCall(
+    queryable: Queryable,
+    runId: string,
+    idempotencyKey: string,
+  ): Promise<{ outboxId: string | null; state: AgentToolCallState; toolUseId: string } | undefined> {
+    const { rows } = await queryable.query<{
+      outbox_id: string | null;
+      state: AgentToolCallState;
+      tool_use_id: string;
+    }>(
+      `SELECT outbox_id, state, tool_use_id FROM agent_tool_calls
+       WHERE run_id = $1 AND idempotency_key = $2`,
+      [runId, idempotencyKey],
+    );
+    const row = rows[0];
+    if (row === undefined) return undefined;
+    return { outboxId: row.outbox_id, state: row.state, toolUseId: row.tool_use_id };
+  }
+
+  /** 记录一条工具调用为 pending_execution（审计通过后、执行前）。 */
+  async recordToolCall(
+    client: PoolClient,
+    runId: string,
+    idempotencyKey: string,
+    toolUseId: string,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO agent_tool_calls (run_id, idempotency_key, tool_use_id, state)
+       VALUES ($1, $2, $3, 'pending_execution')`,
+      [runId, idempotencyKey, toolUseId],
+    );
+  }
+
+  /** 标记工具调用已执行（关联 outbox_id）。 */
+  async markToolCallExecuted(
+    client: PoolClient,
+    runId: string,
+    idempotencyKey: string,
+    outboxId: string,
+  ): Promise<void> {
+    await client.query(
+      `UPDATE agent_tool_calls SET state = 'executed', outbox_id = $1
+       WHERE run_id = $2 AND idempotency_key = $3`,
+      [outboxId, runId, idempotencyKey],
+    );
+  }
 }
 
 /** 判断是否为 PostgreSQL 唯一约束冲突（23505）。 */

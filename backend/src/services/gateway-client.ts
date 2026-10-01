@@ -229,6 +229,11 @@ export interface GroupGateway {
     byAccountId: string,
     accountId: string,
   ): Promise<GroupResult>;
+  kickMember(
+    gatewayGroupId: string,
+    byAccountId: string,
+    targetPlatformUserId: string,
+  ): Promise<GroupResult>;
 }
 
 /** 提取 { error: { code } } 里的 code 字段。 */
@@ -378,6 +383,39 @@ export class HttpGroupGateway implements GroupGateway {
 
     const code = extractCode(await res.json().catch(() => ({})));
     this.log.warn({ ...logCtx, status: res.status, code }, 'gateway: promote 业务错误');
+    return { kind: 'error', status: res.status, code };
+  }
+
+  async kickMember(
+    gatewayGroupId: string,
+    byAccountId: string,
+    targetPlatformUserId: string,
+  ): Promise<GroupResult> {
+    const url = `${this.gatewayUrl}/groups/${encodeURIComponent(gatewayGroupId)}/kick`;
+    const logCtx = { gatewayGroupId, byAccountId, targetPlatformUserId };
+
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ byAccountId, targetPlatformUserId }),
+      });
+    } catch (netErr) {
+      this.log.warn(
+        { ...logCtx, err: netErr instanceof Error ? netErr.message : String(netErr) },
+        'gateway: kickMember 网络异常',
+      );
+      return { kind: 'network', status: 503, code: 'SERVICE_UNAVAILABLE' };
+    }
+
+    if (res.status === 200) {
+      this.log.debug(logCtx, 'gateway: kickMember 成功');
+      return { kind: 'ok', data: undefined };
+    }
+
+    const code = extractCode(await res.json().catch(() => ({})));
+    this.log.warn({ ...logCtx, status: res.status, code }, 'gateway: kickMember 业务错误');
     return { kind: 'error', status: res.status, code };
   }
 }

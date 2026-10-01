@@ -132,6 +132,7 @@ async function main(): Promise<void> {
       outboxRepo: new OutboxRepo(pool),
       accountRepo: new AccountRepo(pool),
       agentClient,
+      groupGateway,
       log: app.log.child({ worker: 'agent-runner' }),
     },
     { intervalMs: 200 },
