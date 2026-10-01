@@ -234,6 +234,11 @@ export interface GroupGateway {
     byAccountId: string,
     targetPlatformUserId: string,
   ): Promise<GroupResult>;
+  /**
+   * leave：账号主动退群（B2 leave-all job 使用）。
+   * 成功 200；账号不在群内 403 SENDER_NOT_IN_GROUP；网关内部错误 500；网络异常 kind='network'。
+   */
+  leaveMember(gatewayGroupId: string, accountId: string): Promise<GroupResult>;
 }
 
 /** 提取 { error: { code } } 里的 code 字段。 */
@@ -416,6 +421,35 @@ export class HttpGroupGateway implements GroupGateway {
 
     const code = extractCode(await res.json().catch(() => ({})));
     this.log.warn({ ...logCtx, status: res.status, code }, 'gateway: kickMember 业务错误');
+    return { kind: 'error', status: res.status, code };
+  }
+
+  async leaveMember(gatewayGroupId: string, accountId: string): Promise<GroupResult> {
+    const url = `${this.gatewayUrl}/groups/${encodeURIComponent(gatewayGroupId)}/leave`;
+    const logCtx = { gatewayGroupId, accountId };
+
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ accountId }),
+      });
+    } catch (netErr) {
+      this.log.warn(
+        { ...logCtx, err: netErr instanceof Error ? netErr.message : String(netErr) },
+        'gateway: leaveMember 网络异常',
+      );
+      return { kind: 'network', status: 503, code: 'SERVICE_UNAVAILABLE' };
+    }
+
+    if (res.status === 200) {
+      this.log.debug(logCtx, 'gateway: leaveMember 成功');
+      return { kind: 'ok', data: undefined };
+    }
+
+    const code = extractCode(await res.json().catch(() => ({})));
+    this.log.warn({ ...logCtx, status: res.status, code }, 'gateway: leaveMember 业务错误');
     return { kind: 'error', status: res.status, code };
   }
 }

@@ -50,6 +50,7 @@ function makeMockGroupGateway(): GroupGateway {
     join: async () => ({ kind: 'ok', data: undefined }),
     promote: async () => ({ kind: 'ok', data: undefined }),
     kickMember: async () => ({ kind: 'ok', data: undefined }),
+    leaveMember: async () => ({ kind: 'ok', data: undefined }),
   };
 }
 

@@ -185,6 +185,16 @@ export class JobRepo {
     return rows[0]?.promote_calls ?? 0;
   }
 
+  /** 追加 error（不置 failed；leave-all 中非群主失败时继续处理其余成员）。 */
+  async appendError(client: PoolClient, jobId: string, err: JobError): Promise<void> {
+    await client.query(
+      `UPDATE jobs
+       SET errors = errors || $1::jsonb, updated_at = now()
+       WHERE id = $2`,
+      [JSON.stringify(err), jobId],
+    );
+  }
+
   /** 追加 error 并把 job 置为 failed。 */
   async appendErrorAndFail(client: PoolClient, jobId: string, err: JobError): Promise<void> {
     await client.query(
@@ -220,6 +230,48 @@ export class JobRepo {
        SET payload = payload - 'inviteLink' - 'inviteReadyAt', updated_at = now()
        WHERE id = $1`,
       [jobId],
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // B2：leave-all job
+  // -------------------------------------------------------------------------
+
+  /** 创建 leave-all job（事务内调用）。成员进度以 group_members 行为准，无需额外游标。 */
+  async createLeaveAllJob(
+    client: PoolClient,
+    payload: { groupId: string; gatewayGroupId: string },
+  ): Promise<string> {
+    const { rows } = await client.query<{ id: string }>(
+      `INSERT INTO jobs (kind, status, payload)
+       VALUES ('leave_all', 'running', $1::jsonb)
+       RETURNING id`,
+      [JSON.stringify(payload)],
+    );
+    const jobId = rows[0]?.id;
+    if (jobId === undefined) throw new Error('创建 leave-all job 失败');
+    return jobId;
+  }
+
+  /** 取可执行的 leave_all job。 */
+  async listRunnableLeaveAllJobs(limit = 10): Promise<JobRow[]> {
+    const { rows } = await this.pool.query<DbJobRow>(
+      `SELECT * FROM jobs
+       WHERE kind = 'leave_all' AND status = 'running'
+       ORDER BY created_at ASC
+       LIMIT $1`,
+      [limit],
+    );
+    return rows.map(fromDb);
+  }
+
+  /** 通用 payload 更新（leave-all 进度追踪用）。 */
+  async mergePayload(client: PoolClient, jobId: string, patch: Record<string, unknown>): Promise<void> {
+    await client.query(
+      `UPDATE jobs
+       SET payload = payload || $1::jsonb, updated_at = now()
+       WHERE id = $2`,
+      [JSON.stringify(patch), jobId],
     );
   }
 }

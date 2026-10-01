@@ -171,6 +171,35 @@ export class GroupRepo {
   }
 
   /**
+   * 按 accountId（UUID）移除群成员（leave-all job 用；不存在时静默忽略）。
+   * 必须在调用方事务内调用（与 job 状态更新原子生效）。
+   */
+  async removeMemberByAccountId(
+    client: PoolClient,
+    groupId: string,
+    accountId: string,
+  ): Promise<void> {
+    await client.query(
+      'DELETE FROM group_members WHERE group_id = $1 AND account_id = $2',
+      [groupId, accountId],
+    );
+  }
+
+  /**
+   * 标记群为 left（leave-all 完成后果，幂等：已是 left 时不动）。
+   * 必须在调用方事务内调用。
+   */
+  async markLeft(client: PoolClient, groupId: string): Promise<boolean> {
+    const { rowCount } = await client.query(
+      `UPDATE groups
+       SET status = 'left', version = version + 1, updated_at = now()
+       WHERE id = $1 AND status <> 'left'`,
+      [groupId],
+    );
+    return (rowCount ?? 0) > 0;
+  }
+
+  /**
    * 按 platformUserId 移除群成员（member_left 事件；不存在时静默忽略）。
    */
   async removeMemberByPlatformUserId(

@@ -301,6 +301,49 @@ export async function registerGroupRoutes(
     },
   );
 
+  // POST /api/groups/:id/leave-all - 全员退群 job 受理（B2 群生命周期）
+  // 契约：202 { jobId }；job 落库后由 LeaveAllJobWorker 异步执行
+  //   非群主按 accountId 字典序先退 → 群主最后退；
+  //   非群主失败记 errors[] 继续其余，群主不退，job failed。
+  app.post<{ Params: GroupParams }>(
+    '/api/groups/:id/leave-all',
+    async (request: FastifyRequest<{ Params: GroupParams }>, reply) => {
+      const { id: groupId } = request.params;
+      const log = request.log;
+
+      if (!UUID_RE.test(groupId)) {
+        throw AppError.badRequest(`路径参数 id 必须是 UUID，当前为 "${groupId}"`);
+      }
+
+      const group = await groupRepo.findById(groupId);
+      if (group === undefined) {
+        throw AppError.notFound(`群 ${groupId} 不存在`);
+      }
+
+      // ---- 事务内落 job（与 202 原子生效；成员进度以 group_members 行为准）----
+      const client = await pool.connect();
+      let jobId: string;
+      try {
+        await client.query('BEGIN');
+        jobId = await jobRepo.createLeaveAllJob(client, {
+          groupId: group.id,
+          gatewayGroupId: group.gatewayGroupId,
+        });
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        log.error({ groupId, err }, 'leave-all: job 落库事务失败，已回滚');
+        throw err;
+      } finally {
+        client.release();
+      }
+
+      log.info({ jobId, groupId, gatewayGroupId: group.gatewayGroupId }, 'leave-all: job 已受理');
+      reply.status(202);
+      return { jobId };
+    },
+  );
+
   // GET /api/groups - 群列表
   app.get('/api/groups', async () => {
     const groups = await groupRepo.listAll();

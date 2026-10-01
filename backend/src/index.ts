@@ -19,6 +19,7 @@ import { Reconcile504Worker } from './workers/reconcile-504.js';
 import { EventConsumer } from './workers/event-consumer.js';
 import { HttpSendGateway, HttpQueryGateway, HttpGroupGateway } from './services/gateway-client.js';
 import { GroupJobWorker } from './workers/group-job.js';
+import { LeaveAllJobWorker } from './workers/leave-all-job.js';
 import { WsHub } from './services/ws-hub.js';
 import { WsPublisher } from './workers/ws-publisher.js';
 import { AgentClient } from './services/agent-client.js';
@@ -117,6 +118,15 @@ async function main(): Promise<void> {
   );
   groupJobWorker.start();
 
+  // 后台 worker：leave-all job 执行器（非群主先退 → 群主最后退）
+  const leaveAllJobWorker = new LeaveAllJobWorker(
+    pool,
+    groupGateway,
+    app.log.child({ worker: 'leave-all-job' }),
+    1000,
+  );
+  leaveAllJobWorker.start();
+
   // 后台 worker：WebSocket 事件推送（轮询 web_events → WsHub 广播）
   const wsPublisher = new WsPublisher(pool, wsHub, { intervalMs: 500, batchSize: 100 });
   await wsPublisher.start();
@@ -164,6 +174,7 @@ async function main(): Promise<void> {
       reconcileWorker.stop();
       eventConsumer.stop();
       groupJobWorker.stop();
+      leaveAllJobWorker.stop();
       wsPublisher.stop();
       agentRunnerWorker.stop();
       sequenceRunnerWorker.stop();

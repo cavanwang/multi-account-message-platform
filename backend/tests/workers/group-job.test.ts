@@ -77,6 +77,15 @@ class FakeGroupGateway implements GroupGateway {
     this.promoteCalls.push({ groupId: gatewayGroupId, byAccountId, accountId });
     return this.promoteResult;
   }
+
+  // 建群 worker 不会用到 kick/leave，提供空实现满足接口
+  async kickMember(): Promise<GroupResult> {
+    throw new Error('not implemented');
+  }
+
+  async leaveMember(): Promise<GroupResult> {
+    throw new Error('not implemented');
+  }
 }
 
 function makeWorker(gw: GroupGateway, intervalMs = 1000): GroupJobWorker {
