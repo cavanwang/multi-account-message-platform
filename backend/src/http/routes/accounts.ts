@@ -15,42 +15,13 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { Pool } from 'pg';
 import type { AppConfig } from '../../config/env.js';
 import { AppError, ErrorCode } from '../errors.js';
-import { AccountService, type GatewayClient } from '../../services/accounts.js';
+import { AccountService } from '../../services/accounts.js';
+import { HttpAccountGateway } from '../../services/gateway-client.js';
 import {
   canTransition,
   isValidStatus,
   type AccountStatus,
 } from '../../domain/account-fsm.js';
-
-/**
- * 网关客户端实现：只走题面正式路径（connect / disconnect）。
- * /_mock/* 是模拟器私有端点，后端一律不得调用（隔离约束，规划 01 §3.5）。
- */
-class HttpGatewayClient implements GatewayClient {
-  constructor(private readonly gatewayUrl: string) {}
-
-  async connect(accountId: string): Promise<{ platformUserId: string }> {
-    const res = await fetch(`${this.gatewayUrl}/accounts/${accountId}/connect`, {
-      method: 'POST',
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`网关 connect 失败: ${res.status} ${body}`);
-    }
-    const data = (await res.json()) as { platformUserId: string };
-    return data;
-  }
-
-  async disconnect(accountId: string): Promise<void> {
-    const res = await fetch(`${this.gatewayUrl}/accounts/${accountId}/disconnect`, {
-      method: 'POST',
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`网关 disconnect 失败: ${res.status} ${body}`);
-    }
-  }
-}
 
 interface RouteDeps {
   config: AppConfig;
@@ -71,7 +42,7 @@ export async function registerAccountRoutes(
   deps: RouteDeps,
 ): Promise<void> {
   const { config, pool } = deps;
-  const gateway = new HttpGatewayClient(config.gatewayUrl);
+  const gateway = new HttpAccountGateway(config.gatewayUrl);
   const accountService = new AccountService(pool, config, gateway);
 
   // GET /api/accounts - 列出所有账号

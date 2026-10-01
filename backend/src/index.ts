@@ -14,6 +14,8 @@ import { closePool, getPool } from './db/pool.js';
 import { assertSchemaUpToDate, SchemaVersionError } from './db/migrate.js';
 import { buildServer } from './http/server.js';
 import { RateLimitSweeper } from './workers/rate-limit-sweeper.js';
+import { OutboxSender } from './workers/outbox-sender.js';
+import { HttpSendGateway } from './services/gateway-client.js';
 
 async function main(): Promise<void> {
   let config: AppConfig;
@@ -49,6 +51,20 @@ async function main(): Promise<void> {
 
   const app = await buildServer({ config, pool });
 
+  // 后台 worker：出站发送（claim → 发网关 → 按错误码收敛状态）
+  // 日志复用 fastify 根 logger 的 child，带 worker 名便于过滤追踪
+  const gatewaySender = new HttpSendGateway(
+    config.gatewayUrl,
+    app.log.child({ component: 'gateway-send' }),
+  );
+  const outboxSender = new OutboxSender(
+    pool,
+    gatewaySender,
+    app.log.child({ worker: 'outbox-sender' }),
+    { batchSize: 10, intervalMs: 1000, backoffBaseMs: 2000, maxBackoffMs: 30_000 },
+  );
+  outboxSender.start();
+
   // --- 优雅退出 ---
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -57,6 +73,7 @@ async function main(): Promise<void> {
     app.log.info({ signal }, '收到退出信号，开始关闭');
     try {
       rateLimitSweeper.stop();
+      outboxSender.stop();
       await app.close();
       await closePool();
       process.exit(0);

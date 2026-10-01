@@ -103,6 +103,20 @@ export class GroupRepo {
   }
 
   /**
+   * 标记群为 unreachable（GROUP_WRITE_FORBIDDEN 后果，幂等：已是 unreachable 时不动）。
+   * 必须在调用方事务内执行（与序列停止、outbox 失败原子生效）。
+   */
+  async markUnreachable(client: PoolClient, groupId: string): Promise<boolean> {
+    const { rowCount } = await client.query(
+      `UPDATE groups
+       SET status = 'unreachable', version = version + 1, updated_at = now()
+       WHERE id = $1 AND status = 'active'`,
+      [groupId],
+    );
+    return (rowCount ?? 0) > 0;
+  }
+
+  /**
    * 判断账号是否为群成员（切片 3 send 端点的成员校验）。
    * 群不存在时同样返回 false（不存在的群自然没有成员）。
    */

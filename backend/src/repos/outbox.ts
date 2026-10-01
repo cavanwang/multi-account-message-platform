@@ -44,6 +44,22 @@ export interface OutboxRow {
   readonly version: number;
 }
 
+/**
+ * claimQueued 的返回行：在 OutboxRow 基础上附带网关调用所需的文本 ID
+ * （accounts.account_id 与 groups.gateway_group_id），避免 worker 逐行回查。
+ */
+export interface ClaimedRow extends OutboxRow {
+  /** accounts.account_id（文本 ID，网关路径参数）。 */
+  readonly accountTextId: string;
+  /** groups.gateway_group_id（网关群 ID）。 */
+  readonly gatewayGroupId: string;
+}
+
+interface DbClaimedExtra {
+  account_text_id: string;
+  gateway_group_id: string;
+}
+
 interface DbOutboxRow {
   id: string;
   group_id: string;
@@ -137,8 +153,8 @@ export class OutboxRepo {
    * 排序按 (created_at, client_msg_id)：created_at 为事务时间，同事务批量
    * 入队时可能相同，client_msg_id 作稳定破平键保证确定性。
    */
-  async claimQueued(client: PoolClient, limit: number): Promise<OutboxRow[]> {
-    const { rows } = await client.query<DbOutboxRow>(
+  async claimQueued(client: PoolClient, limit: number): Promise<ClaimedRow[]> {
+    const { rows } = await client.query<DbOutboxRow & DbClaimedExtra>(
       `UPDATE outbox_messages
        SET generation = generation + 1, updated_at = now()
        WHERE id IN (
@@ -150,12 +166,18 @@ export class OutboxRepo {
          LIMIT $1
          FOR UPDATE OF o SKIP LOCKED
        )
-       RETURNING *`,
+       RETURNING *,
+         (SELECT a.account_id FROM accounts a WHERE a.id = outbox_messages.account_id) AS account_text_id,
+         (SELECT g.gateway_group_id FROM groups g WHERE g.id = outbox_messages.group_id) AS gateway_group_id`,
       [limit],
     );
     // UPDATE ... RETURNING 不保证顺序，按 (created_at, client_msg_id) 重排保持 FIFO 语义
     return rows
-      .map(fromDb)
+      .map((r) => ({
+        ...fromDb(r),
+        accountTextId: r.account_text_id,
+        gatewayGroupId: r.gateway_group_id,
+      }))
       .sort(
         (a, b) =>
           a.createdAt.getTime() - b.createdAt.getTime() ||
