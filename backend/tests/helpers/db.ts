@@ -26,6 +26,11 @@ afterAll(async () => {
 export async function resetDb(): Promise<void> {
   await pool.query(`
     TRUNCATE TABLE
+      agent_run_pending_messages,
+      agent_tool_calls,
+      agent_steps,
+      agent_run_messages,
+      agent_runs,
       group_job_members,
       jobs,
       pending_reconciliations,

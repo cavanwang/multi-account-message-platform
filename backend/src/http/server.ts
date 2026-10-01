@@ -15,6 +15,7 @@ import { registerHealthRoutes } from './routes/health.js';
 import { registerAccountRoutes } from './routes/accounts.js';
 import { registerGroupRoutes } from './routes/groups.js';
 import { registerJobRoutes } from './routes/jobs.js';
+import { registerAgentRunRoutes } from './routes/agent-runs.js';
 import { registerWsRoutes } from './routes/ws.js';
 import { WsHub } from '../services/ws-hub.js';
 
@@ -125,6 +126,9 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
 
     // 切片 4：job 进度查询路由
     await registerJobRoutes(protectedScope, { pool });
+
+    // 切片 5：Agent Run 查询路由
+    await registerAgentRunRoutes(protectedScope, pool);
   });
 
   return app;

@@ -1,16 +1,14 @@
 /**
  * message 事件 handler：群内有新消息（含自己发出的消息回流）。
  *
- * 语义（规划 03 §2.6）：
+ * 语义（规划 03 §2.6 + 05 §2.1）：
  *  - senderPlatformUserId 命中 group_members → isOwn = true（服务账号自己发的消息）；
  *  - upsert messages(group_id, msg_id)（PK 唯一，一行原则）；
- *  - isOwn = true → **不触发 agent**（切片 5 才实现 agent，这里只注释占位）；
+ *  - isOwn = false 且 group.agentEnabled = true → 触发 agent run（创建 run 行，由 worker 执行）；
  *  - 事务内入队 web_event 'message_received'（INV-5）。
- *
- * 乱序/补投容忍：重复收到同一 (groupId,msgId) → ON CONFLICT DO UPDATE，
- * 最后写入者覆盖 text/sent_at；不丢弃"太旧"的消息。
  */
 import { GroupRepo } from '../../repos/groups.js';
+import { AgentRunRepo } from '../../repos/agent-runs.js';
 import { upsertMessage } from '../../repos/messages.js';
 import { enqueueWebEvent } from '../../repos/web-events.js';
 import type { HandlerContext } from './types.js';
@@ -49,8 +47,21 @@ export async function handleMessage(ctx: HandlerContext, payload: unknown): Prom
     mediaUrl: mediaUrl ?? null,
   });
 
-  // 自身消息不触发 agent（切片 5 占位）
-  // if (!isOwn) { agentTrigger(...) }
+  // 非自己消息 + agentEnabled → 触发 agent run
+  if (!isOwn && group.agentEnabled) {
+    const agentRunRepo = new AgentRunRepo(ctx.pool);
+    const run = await agentRunRepo.createRun(ctx.client, group.id);
+    if (run === null) {
+      // 已有 running run → 消息记为待处理
+      // 找到当前 running 的 runId（唯一索引保证至多一个）
+      const runs = await agentRunRepo.listByGroup(ctx.client, group.id);
+      const runningRun = runs.find((r) => r.status === 'running');
+      if (runningRun !== undefined) {
+        await agentRunRepo.addPendingMessage(ctx.client, runningRun.id, msgId);
+      }
+    }
+    // run !== null → 新 run 已创建，由 agent-runner-worker 轮询执行
+  }
 
   await enqueueWebEvent(ctx.client, 'message_received', {
     groupId: group.id,

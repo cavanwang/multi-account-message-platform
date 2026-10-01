@@ -21,6 +21,12 @@ import { HttpSendGateway, HttpQueryGateway, HttpGroupGateway } from './services/
 import { GroupJobWorker } from './workers/group-job.js';
 import { WsHub } from './services/ws-hub.js';
 import { WsPublisher } from './workers/ws-publisher.js';
+import { AgentClient } from './services/agent-client.js';
+import { AgentRunRepo } from './repos/agent-runs.js';
+import { GroupRepo } from './repos/groups.js';
+import { OutboxRepo } from './repos/outbox.js';
+import { AccountRepo } from './repos/accounts.js';
+import { AgentRunnerWorker } from './workers/agent-runner-worker.js';
 
 async function main(): Promise<void> {
   let config: AppConfig;
@@ -113,6 +119,25 @@ async function main(): Promise<void> {
   const wsPublisher = new WsPublisher(pool, wsHub, { intervalMs: 500, batchSize: 100 });
   await wsPublisher.start();
 
+  // 后台 worker：Agent Run 执行器（轮询 running runs → runAgent）
+  const agentClient = new AgentClient(
+    config.agentUrl,
+    app.log.child({ component: 'agent-client' }),
+  );
+  const agentRunnerWorker = new AgentRunnerWorker(
+    {
+      pool,
+      agentRunRepo: new AgentRunRepo(pool),
+      groupRepo: new GroupRepo(pool),
+      outboxRepo: new OutboxRepo(pool),
+      accountRepo: new AccountRepo(pool),
+      agentClient,
+      log: app.log.child({ worker: 'agent-runner' }),
+    },
+    { intervalMs: 200 },
+  );
+  agentRunnerWorker.start();
+
   // --- 优雅退出 ---
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -126,6 +151,7 @@ async function main(): Promise<void> {
       eventConsumer.stop();
       groupJobWorker.stop();
       wsPublisher.stop();
+      agentRunnerWorker.stop();
       await app.close();
       await closePool();
       process.exit(0);
