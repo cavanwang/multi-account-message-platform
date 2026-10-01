@@ -57,6 +57,19 @@ export class AccountRepo {
   }
 
   /**
+   * 按文本 account_id 批量查询（建群受理的成员校验，避免 N+1 往返）。
+   * 返回顺序不保证与入参一致，调用方需自行按入参顺序归并。
+   */
+  async findByAccountIds(accountIds: readonly string[]): Promise<AccountRow[]> {
+    if (accountIds.length === 0) return [];
+    const { rows } = await this.pool.query<DbAccountRow>(
+      'SELECT * FROM accounts WHERE account_id = ANY($1)',
+      [accountIds as string[]],
+    );
+    return rows.map(fromDb);
+  }
+
+  /**
    * 按平台用户 ID 反查账号（member_joined 事件：platformUserId → 服务账号）。
    * 外部用户无对应账号 → undefined。
    */

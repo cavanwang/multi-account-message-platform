@@ -26,6 +26,8 @@ afterAll(async () => {
 export async function resetDb(): Promise<void> {
   await pool.query(`
     TRUNCATE TABLE
+      group_job_members,
+      jobs,
       pending_reconciliations,
       events_inbox,
       events_cursor,
@@ -43,8 +45,16 @@ export async function resetDb(): Promise<void> {
     INSERT INTO accounts (account_id, status, version)
     VALUES ('acct-1','idle',1), ('acct-2','idle',1), ('acct-3','idle',1), ('acct-4','idle',1)
   `);
-  // events_cursor 是单行表，TRUNCATE 后恢复初始行（与迁移 0006 一致）
-  await pool.query(`INSERT INTO events_cursor (id, last_seen_event_id) VALUES (1, 0)`);
+  // events_cursor / ws_push_cursor 是单行表，TRUNCATE 后恢复初始行（与迁移 0006/0007 一致）。
+  // 多测试文件并发跑 resetDb 时 TRUNCATE→INSERT 存在竞态窗口，用 ON CONFLICT 幂等重置。
+  await pool.query(
+    `INSERT INTO events_cursor (id, last_seen_event_id) VALUES (1, 0)
+     ON CONFLICT (id) DO UPDATE SET last_seen_event_id = 0`,
+  );
+  await pool.query(
+    `INSERT INTO ws_push_cursor (id, last_pushed_seq) VALUES (1, 0)
+     ON CONFLICT (id) DO UPDATE SET last_pushed_seq = 0`,
+  );
 }
 
 /** 查询单行（无结果返回 undefined）。 */

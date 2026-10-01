@@ -30,6 +30,9 @@ export const ErrorCode = {
   // 出站（切片 3）
   ACCOUNT_UNAVAILABLE: 'ACCOUNT_UNAVAILABLE',
   ACCOUNT_NOT_IN_GROUP: 'ACCOUNT_NOT_IN_GROUP',
+
+  // 建群（切片 4）
+  ACCOUNT_NOT_ONLINE: 'ACCOUNT_NOT_ONLINE',
 } as const;
 
 export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode];

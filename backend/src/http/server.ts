@@ -13,6 +13,7 @@ import { registerAuthRoutes } from './routes/auth.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerAccountRoutes } from './routes/accounts.js';
 import { registerGroupRoutes } from './routes/groups.js';
+import { registerJobRoutes } from './routes/jobs.js';
 
 export interface ServerDeps {
   readonly config: AppConfig;
@@ -110,7 +111,8 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     // 切片 3：群出站消息路由
     await registerGroupRoutes(protectedScope, { config, pool });
 
-    // 切片 4+ 在此注册：/api/jobs ...
+    // 切片 4：job 进度查询路由
+    await registerJobRoutes(protectedScope, { pool });
   });
 
   return app;
