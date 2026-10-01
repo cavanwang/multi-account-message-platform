@@ -122,6 +122,10 @@ export async function runAgent(deps: AgentRunnerDeps, runId: string): Promise<vo
     // ---- 崩溃恢复：检查最后一条 assistant tool_use 是否有对应 tool_result ----
     await recoverIncompleteToolUse(deps, client, run, messages);
 
+    // 续跑（worker 重启 / 前次崩溃）时，stepNo 必须从已有步骤数接着排；
+    // 从 0 重排会撞 agent_steps (run_id, step_no) 唯一键，导致 resume 必死循环。
+    stepNo = (await agentRunRepo.listSteps(client, runId)).length;
+
     // 主循环
     while (run.status === 'running') {
       stepNo++;
@@ -371,14 +375,17 @@ async function recoverIncompleteToolUse(
       ? await deps.outboxRepo.findById(toolCall.outboxId)
       : undefined;
     const status = outbox?.deliveryStatus ?? 'unknown';
-    result = { content: { status, clientMsgId: toolCall.idempotencyKey, recovered: true }, isError: false };
+    // 优先用 outbox 行上的真实 client_msg_id；老数据兜底用幂等键
+    const clientMsgId = outbox?.clientMsgId ?? toolCall.clientMsgId ?? toolCall.idempotencyKey;
+    result = { content: { status, clientMsgId, recovered: true }, isError: false };
   } else if (toolCall !== undefined && toolCall.state === 'pending_execution') {
-    // pending_execution → 检查 outbox 是否已存在（crash 在 enqueue 之后、mark 之前）
-    const outbox = await deps.outboxRepo.findByClientMsgId(toolCall.idempotencyKey);
+    // pending_execution → 检查 outbox 是否已存在（crash 在 enqueue 之后、mark 之前）。
+    // 定位键是 recordToolCall 时生成的 client_msg_id；老数据（无该列）兜底用幂等键。
+    const outbox = await deps.outboxRepo.findByClientMsgId(toolCall.clientMsgId ?? toolCall.idempotencyKey);
     if (outbox !== undefined) {
       // 已入队但未标记 → 回填标记，返回状态
       await deps.agentRunRepo.markToolCallExecuted(client, run.id, toolCall.idempotencyKey, outbox.id);
-      result = { content: { status: outbox.deliveryStatus, clientMsgId: toolCall.idempotencyKey, recovered: true }, isError: false };
+      result = { content: { status: outbox.deliveryStatus, clientMsgId: outbox.clientMsgId, recovered: true }, isError: false };
     } else {
       // 未入队 → 重放执行
       result = await executeTool(deps, client, run, lastToolUse, null);
@@ -515,12 +522,14 @@ async function execSendMessage(
   // 幂等键检查：同 run 同 key 已执行 → 返回当前状态，不审计不重发
   const existing = await deps.agentRunRepo.getToolCall(client, run.id, idempotencyKey);
   if (existing !== undefined && existing.state === 'executed' && existing.outboxId !== null) {
-    const { rows } = await client.query<{ delivery_status: string }>(
-      'SELECT delivery_status FROM outbox_messages WHERE id = $1',
+    const { rows } = await client.query<{ delivery_status: string; client_msg_id: string }>(
+      'SELECT delivery_status, client_msg_id FROM outbox_messages WHERE id = $1',
       [existing.outboxId],
     );
     const status = rows[0]?.delivery_status ?? 'unknown';
-    return { content: { status, clientMsgId: idempotencyKey, idempotent: true }, isError: false };
+    // 返回真实的 client_msg_id（后端生成的 UUID），不是 agent 的幂等键
+    const clientMsgId = rows[0]?.client_msg_id ?? existing.clientMsgId ?? idempotencyKey;
+    return { content: { status, clientMsgId, idempotent: true }, isError: false };
   }
 
   // 审计
@@ -538,18 +547,25 @@ async function execSendMessage(
     return { content: { error: 'NO_AVAILABLE_ACCOUNT' }, isError: true, errorCode: 'NO_AVAILABLE_ACCOUNT' };
   }
 
-  // 记录幂等键 → 入队 outbox → 标记已执行
-  await deps.agentRunRepo.recordToolCall(client, run.id, idempotencyKey, toolUseId);
+  /**
+   * outbox.client_msg_id 一律由后端生成（UUID），不能把 agent 的幂等键直接写进去：
+   *   1. agent 可能用任意非 UUID 字符串作 key（如 agent-mock 的 "ik-1"）；
+   *   2. outbox.client_msg_id 有全局唯一约束，而 agent 的幂等键只保证 run 维度唯一
+   *      （agent-mock 每个 run 首次 send 都用 "ik-1"），直写会撞 23505。
+   * agent_tool_calls.client_msg_id 记录二者的映射，崩溃恢复按它定位孤儿 outbox 行。
+   */
+  const clientMsgId = randomUUID();
+  await deps.agentRunRepo.recordToolCall(client, run.id, idempotencyKey, toolUseId, clientMsgId);
   const outbox = await deps.outboxRepo.enqueue(client, {
     groupId: run.groupId,
     accountId: onlineAccount.id,
-    clientMsgId: idempotencyKey,
+    clientMsgId,
     text,
     origin: 'agent',
   });
   await deps.agentRunRepo.markToolCallExecuted(client, run.id, idempotencyKey, outbox.id);
 
-  return { content: { status: 'queued', clientMsgId: idempotencyKey }, isError: false, auditVerdict: 'pass' };
+  return { content: { status: 'queued', clientMsgId }, isError: false, auditVerdict: 'pass' };
 }
 
 /**

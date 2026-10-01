@@ -324,12 +324,52 @@ describe('AgentRunner F1', () => {
     const deps = makeDeps(client);
     await runAgent(deps, runId);
 
-    // outbox 里应该只有 1 条消息（幂等去重）
+    // outbox 里应该只有 1 条消息（幂等去重）。
+    // client_msg_id 是后端生成的 UUID，需经 agent_tool_calls.outbox_id 关联断言。
     const { rows } = await pool.query<{ count: string }>(
-      'SELECT COUNT(*)::text AS count FROM outbox_messages WHERE client_msg_id = $1',
-      [sameKey],
+      `SELECT COUNT(*)::text AS count FROM outbox_messages o
+       JOIN agent_tool_calls t ON t.outbox_id = o.id
+       WHERE t.run_id = $1 AND t.idempotency_key = $2`,
+      [runId, sameKey],
     );
     expect(Number(rows[0]?.count)).toBe(1);
+  });
+
+  it('send_message 非 UUID 幂等键（agent-mock 风格 "ik-1"）：全链路不崩（0011 回归）', async () => {
+    const { groupId } = await seedGroupWithMember('acct-1');
+    const runId = await createRunningRun(groupId);
+    // agent 幂等键是 opaque string（无 UUID 格式约束），绝不能直接写进 outbox.client_msg_id
+    const opaqueKey = 'ik-1';
+
+    let turnCount = 0;
+    const client: AgentClientLike = {
+      callTurn: async () => {
+        turnCount++;
+        if (turnCount <= 2) {
+          return { kind: 'ok', response: { id: 'r', model: 'm', stop_reason: 'tool_use', content: [{ type: 'tool_use', id: `tu${turnCount}`, name: 'send_message', input: { text: 'hi', idempotency_key: opaqueKey } }] } };
+        }
+        return { kind: 'ok', response: { id: 'r', model: 'm', stop_reason: 'end_turn', content: [{ type: 'tool_use', id: 'tu3', name: 'finish', input: { summary: 'done' } }] } };
+      },
+      callAudit: async () => ({ kind: 'pass' }),
+    };
+
+    const deps = makeDeps(client);
+    await runAgent(deps, runId);
+
+    // 第二次同 key 幂等去重：outbox 恰好 1 条（经 agent_tool_calls.outbox_id 关联）
+    const { rows } = await pool.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM outbox_messages o
+       JOIN agent_tool_calls t ON t.outbox_id = o.id
+       WHERE t.run_id = $1 AND t.idempotency_key = $2`,
+      [runId, opaqueKey],
+    );
+    expect(Number(rows[0]?.count)).toBe(1);
+    // 映射列记录的是后端生成的 UUID，而不是 agent 的 opaque key
+    const tc = await deps.agentRunRepo.getToolCall(pool, runId, opaqueKey);
+    expect(tc?.state).toBe('executed');
+    expect(tc?.clientMsgId).toMatch(/^[0-9a-f-]{36}$/);
+    const run = await deps.agentRunRepo.getRun(pool, runId);
+    expect(run?.status).toBe('finished');
   });
 
   it('send_message 无 online 账号 → NO_AVAILABLE_ACCOUNT', async () => {
@@ -375,8 +415,8 @@ describe('AgentRunner F1', () => {
       [groupId, idemKey],
     );
     await pool.query(
-      `INSERT INTO agent_tool_calls (run_id, idempotency_key, outbox_id, tool_use_id, state)
-       VALUES ($1, $2, $3, 'tu-crash', 'executed')`,
+      `INSERT INTO agent_tool_calls (run_id, idempotency_key, outbox_id, tool_use_id, state, client_msg_id)
+       VALUES ($1, $2, $3, 'tu-crash', 'executed', $2)`,
       [runId, idemKey, outboxRows[0]!.id],
     );
 
@@ -415,15 +455,14 @@ describe('AgentRunner F1', () => {
     }
 
     // outbox 已入队但 tool_call 仍是 pending_execution（crash 在 mark 之前）
-    const { rows: outboxRows } = await pool.query<{ id: string }>(
+    await pool.query(
       `INSERT INTO outbox_messages (group_id, account_id, client_msg_id, text, delivery_status, origin)
-       SELECT $1, (SELECT id FROM accounts WHERE account_id='acct-1'), $2, 'hi', 'queued', 'agent'
-       RETURNING id`,
+       SELECT $1, (SELECT id FROM accounts WHERE account_id='acct-1'), $2, 'hi', 'queued', 'agent'`,
       [groupId, idemKey],
     );
     await pool.query(
-      `INSERT INTO agent_tool_calls (run_id, idempotency_key, tool_use_id, state)
-       VALUES ($1, $2, 'tu-pending', 'pending_execution')`,
+      `INSERT INTO agent_tool_calls (run_id, idempotency_key, tool_use_id, state, client_msg_id)
+       VALUES ($1, $2, 'tu-pending', 'pending_execution', $2)`,
       [runId, idemKey],
     );
 
@@ -442,6 +481,43 @@ describe('AgentRunner F1', () => {
       [idemKey],
     );
     expect(Number(rows[0]?.count)).toBe(1);
+  });
+
+  it('崩溃恢复续跑：stepNo 从已有步骤数续排，不撞 (run_id, step_no) 唯一键', async () => {
+    const { groupId } = await seedGroupWithMember('acct-1');
+    const runId = await createRunningRun(groupId);
+
+    // 模拟 crash 前已完成第 1 步：配对的 tool_use/tool_result + step_no=1
+    const toolUseBlock: AgentContentBlock = { type: 'tool_use', id: 'tu1', name: 'get_recent_messages', input: { limit: 10 } };
+    const toolResultBlock: AgentContentBlock = { type: 'tool_result', tool_use_id: 'tu1', content: '[]', is_error: false };
+    {
+      const c = await pool.connect();
+      try {
+        const repo = new AgentRunRepo(pool);
+        await repo.appendMessage(c, runId, 'assistant', [toolUseBlock]);
+        await repo.appendMessage(c, runId, 'user', [toolResultBlock]);
+        await repo.insertStep(c, runId, 1, {
+          kind: 'tool_use', toolUseId: 'tu1', name: 'get_recent_messages', input: { limit: 10 },
+          resultSummary: '[]', isError: false, errorCode: null, auditVerdict: null, rawResponse: null,
+        });
+      } finally {
+        c.release();
+      }
+    }
+
+    // 续跑：agent 直接 finish → 应落 step_no=2，而不是从 1 重排撞唯一键
+    const script: AgentMessage[] = [
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'tu2', name: 'finish', input: { summary: 'done' } }] },
+    ];
+    const deps = makeDeps(new MockAgentClient(script));
+    await runAgent(deps, runId);
+
+    const run = await deps.agentRunRepo.getRun(pool, runId);
+    expect(run?.status).toBe('finished');
+
+    const steps = await deps.agentRunRepo.listSteps(pool, runId);
+    expect(steps.map((s) => s.stepNo)).toEqual([1, 2]);
+    expect(steps[1]?.kind).toBe('final');
   });
 
   // ---- F3：agentEnabled / unreachable → cancelled ----

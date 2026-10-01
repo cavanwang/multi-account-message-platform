@@ -266,20 +266,21 @@ export class AgentRunRepo {
     queryable: Queryable,
     runId: string,
     idempotencyKey: string,
-  ): Promise<{ outboxId: string | null; state: AgentToolCallState; toolUseId: string; idempotencyKey: string } | undefined> {
+  ): Promise<{ outboxId: string | null; state: AgentToolCallState; toolUseId: string; idempotencyKey: string; clientMsgId: string | null } | undefined> {
     const { rows } = await queryable.query<{
       outbox_id: string | null;
       state: AgentToolCallState;
       tool_use_id: string;
       idempotency_key: string;
+      client_msg_id: string | null;
     }>(
-      `SELECT outbox_id, state, tool_use_id, idempotency_key FROM agent_tool_calls
+      `SELECT outbox_id, state, tool_use_id, idempotency_key, client_msg_id FROM agent_tool_calls
        WHERE run_id = $1 AND idempotency_key = $2`,
       [runId, idempotencyKey],
     );
     const row = rows[0];
     if (row === undefined) return undefined;
-    return { outboxId: row.outbox_id, state: row.state, toolUseId: row.tool_use_id, idempotencyKey: row.idempotency_key };
+    return { outboxId: row.outbox_id, state: row.state, toolUseId: row.tool_use_id, idempotencyKey: row.idempotency_key, clientMsgId: row.client_msg_id };
   }
 
   /** 按 tool_use_id 查工具调用记录（崩溃恢复时定位未完成的调用）。 */
@@ -287,32 +288,41 @@ export class AgentRunRepo {
     queryable: Queryable,
     runId: string,
     toolUseId: string,
-  ): Promise<{ outboxId: string | null; state: AgentToolCallState; idempotencyKey: string } | undefined> {
+  ): Promise<{ outboxId: string | null; state: AgentToolCallState; idempotencyKey: string; clientMsgId: string | null } | undefined> {
     const { rows } = await queryable.query<{
       outbox_id: string | null;
       state: AgentToolCallState;
       idempotency_key: string;
+      client_msg_id: string | null;
     }>(
-      `SELECT outbox_id, state, idempotency_key FROM agent_tool_calls
+      `SELECT outbox_id, state, idempotency_key, client_msg_id FROM agent_tool_calls
        WHERE run_id = $1 AND tool_use_id = $2`,
       [runId, toolUseId],
     );
     const row = rows[0];
     if (row === undefined) return undefined;
-    return { outboxId: row.outbox_id, state: row.state, idempotencyKey: row.idempotency_key };
+    return { outboxId: row.outbox_id, state: row.state, idempotencyKey: row.idempotency_key, clientMsgId: row.client_msg_id };
   }
 
-  /** 记录一条工具调用为 pending_execution（审计通过后、执行前）。 */
+  /**
+   * 记录一条工具调用为 pending_execution（审计通过后、执行前）。
+   *
+   * clientMsgId：本次调用入队 outbox 时生成的 client_msg_id（UUID）。
+   * 崩溃恢复时靠它定位"已入队但 markToolCallExecuted 未落库"的孤儿 outbox 行
+   * （不能用 idempotencyKey——agent 可能用任意非 UUID 字符串作 key，
+   * 且 run 维度的 key 撞不上全局唯一的 outbox.client_msg_id）。
+   */
   async recordToolCall(
     client: PoolClient,
     runId: string,
     idempotencyKey: string,
     toolUseId: string,
+    clientMsgId: string,
   ): Promise<void> {
     await client.query(
-      `INSERT INTO agent_tool_calls (run_id, idempotency_key, tool_use_id, state)
-       VALUES ($1, $2, $3, 'pending_execution')`,
-      [runId, idempotencyKey, toolUseId],
+      `INSERT INTO agent_tool_calls (run_id, idempotency_key, tool_use_id, state, client_msg_id)
+       VALUES ($1, $2, $3, 'pending_execution', $4)`,
+      [runId, idempotencyKey, toolUseId, clientMsgId],
     );
   }
 

@@ -112,8 +112,13 @@ function buildTurnResponse(
 ): TurnResponse {
   switch (mode) {
     case 'unknown_tool': {
-      // 调用一个不在 tools 列表中的工具
-      return toolUseResponse(session, 'nonexistent_tool', {});
+      // 只在首个 turn 调用一个不在 tools 列表中的工具，之后走正常脚本收尾。
+      // 若每次都坏：后端回 is_error tool_result 后又收到 unknown_tool，
+      // 毫秒级耗尽 12 步预算，run 只能 budget_exhausted，无法验证"坏一步后正常收尾"。
+      if (session.lastTool === null) {
+        return toolUseResponse(session, 'nonexistent_tool', {});
+      }
+      break;
     }
     case 'invalid_input': {
       // get_recent_messages 缺少必填参数 limit
@@ -140,12 +145,14 @@ function buildTurnResponse(
       return toolUseResponse(session, 'get_recent_messages', { limit: 10 });
     }
     case 'retry_same_key': {
-      // send_message 后用同一 idempotency_key 再调一次
-      if (session.lastTool === 'send_message') {
+      // send_message 后用同一 idempotency_key 重试，最多 2 次（sendCount: 首次1 + 重试2），
+      // 之后走正常脚本收尾。不能无限重试：后端幂等命中是纯 DB 查询，
+      // 无限重试会毫秒级耗尽后端 12 步预算，run 以 budget_exhausted 告终。
+      if (session.lastTool === 'send_message' && session.sendCount < 3) {
         const key = session.lastIdempotencyKey ?? 'ik-retry';
         return toolUseResponse(session, 'send_message', { text: '重试', idempotency_key: key });
       }
-      // 否则走正常流程
+      // 否则走正常流程（send_message → finish）
       break;
     }
     default:

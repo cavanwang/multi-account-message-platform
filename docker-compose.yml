@@ -4,8 +4,8 @@
 #   db            PostgreSQL 16，带健康检查；数据存 named volume
 #   backend       后端 API；启动前自动执行 migration，schema 落后则拒绝启动
 #   gateway-mock  消息网关模拟器（切片 1 已实现）
-#   agent-mock    Agent 服务模拟器（切片 5 实现，当前为占位）
-#   frontend      控制台前端（切片 5 实现，当前为占位）
+#   agent-mock    Agent 服务模拟器（切片 5 已实现）
+#   frontend      控制台前端（切片 5 已实现）
 #
 # 端口映射（宿主机 → 容器）
 #   3000 → backend      后端 API
@@ -70,7 +70,8 @@ services:
     build:
       context: ./agent-mock
     environment:
-      PORT: "3200"
+      # 进程读取的是 AGENT_MOCK_PORT（不是 PORT），必须与端口映射及 backend 的 AGENT_URL 对齐
+      AGENT_MOCK_PORT: "3200"
     ports:
       - "3200:3200"
     restart: unless-stopped
