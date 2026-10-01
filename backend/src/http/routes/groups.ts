@@ -34,6 +34,7 @@ import { AccountRepo } from '../../repos/accounts.js';
 import { GroupRepo } from '../../repos/groups.js';
 import { JobRepo } from '../../repos/jobs.js';
 import { OutboxRepo } from '../../repos/outbox.js';
+import { listTimeline, decodeCursor, type TimelineItem } from '../../repos/messages.js';
 import type { GroupRow, GroupMemberRow } from '../../repos/groups.js';
 
 interface RouteDeps {
@@ -58,6 +59,11 @@ interface SendBody {
 interface PatchGroupBody {
   agentEnabled?: unknown;
   autoKickEnabled?: unknown;
+}
+
+interface MessagesQuery {
+  before?: string;
+  limit?: string;
 }
 
 /**
@@ -371,6 +377,36 @@ export async function registerGroupRoutes(
       return toGroupSummary(updated);
     },
   );
+
+  // GET /api/groups/:id/messages - 消息时间线（游标分页）
+  app.get<{ Params: GroupParams; Querystring: MessagesQuery }>(
+    '/api/groups/:id/messages',
+    async (request: FastifyRequest<{ Params: GroupParams; Querystring: MessagesQuery }>) => {
+      const { id: groupId } = request.params;
+      if (!UUID_RE.test(groupId)) {
+        throw AppError.badRequest(`路径参数 id 必须是 UUID，当前为 "${groupId}"`);
+      }
+
+      // 群存在性校验（不存在的群返回 404，而非空列表）
+      const group = await groupRepo.findById(groupId);
+      if (group === undefined) {
+        throw AppError.notFound(`群 ${groupId} 不存在`);
+      }
+
+      const cursor = decodeCursor(request.query.before);
+      // limit 默认 50，上限 50；非法值回退到 50
+      const rawLimit = Number(request.query.limit);
+      const limit =
+        Number.isFinite(rawLimit) && rawLimit >= 1 && rawLimit <= 50 ? Math.floor(rawLimit) : 50;
+
+      const { items, nextCursor } = await listTimeline(pool, groupId, cursor, limit);
+
+      return {
+        items: items.map(toTimelineDto),
+        nextCursor,
+      };
+    },
+  );
 }
 
 /** 群列表/摘要响应（不含 members）。 */
@@ -394,5 +430,19 @@ function toMemberDto(m: GroupMemberRow): Record<string, unknown> {
     platformUserId: m.platformUserId,
     role: m.role,
     joinedAt: m.joinedAt.toISOString(),
+  };
+}
+
+/** 时间线条目响应。 */
+function toTimelineDto(item: TimelineItem): Record<string, unknown> {
+  return {
+    msgId: item.msgId,
+    clientMsgId: item.clientMsgId,
+    senderPlatformUserId: item.senderPlatformUserId,
+    isOwn: item.isOwn,
+    text: item.text,
+    sentAt: item.sentAt.toISOString(),
+    deliveryStatus: item.deliveryStatus,
+    failCode: item.failCode,
   };
 }
