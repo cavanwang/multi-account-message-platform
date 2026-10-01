@@ -2,23 +2,43 @@
  * 限流到期恢复 worker。
  *
  * 每秒扫描一次数据库，将 rate_limited_until <= now() 的账号恢复为 online。
- * 这是崩溃安全的：不依赖内存 timer，重启后自然继续。
+ * 这是崩溃安全的：不依赖内存 timer，重启后自然继续（规划 02 §3）。
  *
- * 需求 §5 A1：
- *   - rate_limited 由 RATE_LIMITED 触发，retryAfterSeconds 后自动回到 online
- *   - 到期时若账号已不是 rate_limited（被操作员标记离线等）则不做转移
+ * 恢复与事件入队在同一条 SQL（CTE）内完成：
+ *   - UPDATE 恢复账号
+ *   - 同时为每个被恢复账号插入 account_status_changed 事件
+ * 保证"状态变为 online"与"前端可见事件"同时落库（INV-5）。
+ *
+ * 到期时若账号已不是 rate_limited（WHERE 条件不匹配）自然不会被恢复。
  */
 import type { Pool } from 'pg';
-import type { AccountRepo } from '../repos/accounts.js';
 
 export interface RateLimitSweeperOptions {
   /** 扫描间隔（毫秒），默认 1000。 */
   intervalMs?: number;
-  /** 是否已启动（用于优雅关闭）。 */
-  onStart?: () => void;
-  /** 恢复账号后的回调（用于推送 WS 事件）。 */
+  /** 恢复账号后的回调（切片 4 用于实时通知 WS；事件本身已落库，断线可补齐）。 */
   onRecover?: (accountId: string) => void;
 }
+
+/** 恢复并补发事件的 SQL：UPDATE 与 INSERT 在同一语句的隐式事务内原子提交。 */
+const SWEEP_SQL = `
+  WITH recovered AS (
+    UPDATE accounts
+    SET status = 'online',
+        rate_limited_until = NULL,
+        retry_after_seconds = NULL,
+        version = version + 1,
+        updated_at = now()
+    WHERE status = 'rate_limited'
+      AND rate_limited_until <= now()
+    RETURNING account_id
+  )
+  INSERT INTO web_events (type, payload)
+  SELECT 'account_status_changed',
+         jsonb_build_object('accountId', account_id, 'from', 'rate_limited', 'to', 'online')
+  FROM recovered
+  RETURNING jsonb_extract_path_text(payload, 'accountId') AS account_id
+`;
 
 export class RateLimitSweeper {
   private running = false;
@@ -26,7 +46,6 @@ export class RateLimitSweeper {
 
   constructor(
     private readonly pool: Pool,
-    private readonly repo: AccountRepo,
     private readonly options: RateLimitSweeperOptions = {},
   ) {}
 
@@ -36,7 +55,6 @@ export class RateLimitSweeper {
   start(): void {
     if (this.running) return;
     this.running = true;
-    this.options.onStart?.();
     this.scheduleNext();
   }
 
@@ -59,34 +77,15 @@ export class RateLimitSweeper {
 
   private async sweep(): Promise<void> {
     try {
-      const recoveredIds = await this.sweepExpiredRateLimits();
-      for (const accountId of recoveredIds) {
-        this.options.onRecover?.(accountId);
+      const { rows } = await this.pool.query<{ account_id: string }>(SWEEP_SQL);
+      for (const row of rows) {
+        this.options.onRecover?.(row.account_id);
       }
     } catch (err) {
-      // 记录错误但不中断 worker
+      // 记录错误但不中断 worker：下一轮扫描会重试，到期恢复天然幂等
       console.error('[RateLimitSweeper] sweep 失败:', err);
     } finally {
       this.scheduleNext();
     }
-  }
-
-  /**
-   * 扫描并恢复过期的限流账号。
-   * @returns 被恢复的账号 ID 列表
-   */
-  private async sweepExpiredRateLimits(): Promise<string[]> {
-    const { rows } = await this.pool.query<{ id: string; account_id: string }>(
-      `UPDATE accounts
-       SET status = 'online',
-           rate_limited_until = NULL,
-           retry_after_seconds = NULL,
-           version = version + 1,
-           updated_at = now()
-       WHERE status = 'rate_limited'
-         AND rate_limited_until <= now()
-       RETURNING id, account_id`,
-    );
-    return rows.map((r) => r.account_id);
   }
 }

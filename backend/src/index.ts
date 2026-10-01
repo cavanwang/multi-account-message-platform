@@ -13,6 +13,7 @@ import { loadConfig, type AppConfig } from './config/env.js';
 import { closePool, getPool } from './db/pool.js';
 import { assertSchemaUpToDate, SchemaVersionError } from './db/migrate.js';
 import { buildServer } from './http/server.js';
+import { RateLimitSweeper } from './workers/rate-limit-sweeper.js';
 
 async function main(): Promise<void> {
   let config: AppConfig;
@@ -41,6 +42,11 @@ async function main(): Promise<void> {
   }
 
   const pool = getPool(config.databaseUrl);
+
+  // 后台 worker：限流到期自动恢复 online（崩溃安全，1s 周期扫描 DB）
+  const rateLimitSweeper = new RateLimitSweeper(pool);
+  rateLimitSweeper.start();
+
   const app = await buildServer({ config, pool });
 
   // --- 优雅退出 ---
@@ -50,6 +56,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     app.log.info({ signal }, '收到退出信号，开始关闭');
     try {
+      rateLimitSweeper.stop();
       await app.close();
       await closePool();
       process.exit(0);

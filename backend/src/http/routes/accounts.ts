@@ -1,17 +1,31 @@
 /**
  * 账号相关路由：
- *   - GET /api/accounts - 列出所有账号
- *   - POST /api/accounts/:id/connect - connect 账号
- *   - POST /api/accounts/:id/transition - 手动状态转移
+ *   - GET  /api/accounts                - 列出所有账号
+ *   - POST /api/accounts/:id/connect    - connect 账号（idle/disconnected → online）
+ *   - POST /api/accounts/:id/transition - 手动状态转移（CAS + expectedFrom）
+ *
+ * 转移语义（规划 02 §3）：
+ *   1. to / expectedFrom 必填且属于合法状态集，否则 400
+ *   2. to === expectedFrom（自环）→ 409 ILLEGAL_TRANSITION
+ *   3. rate_limited 只能由网关 429 进入，手动指定 → 400
+ *   4. expectedFrom → to 不在转移表 → 409 ILLEGAL_TRANSITION
+ *   5. 账号不存在 → 404；当前状态 ≠ expectedFrom → 409 CAS_CONFLICT（CAS 本身兜底）
  */
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { Pool } from 'pg';
 import type { AppConfig } from '../../config/env.js';
 import { AppError, ErrorCode } from '../errors.js';
 import { AccountService, type GatewayClient } from '../../services/accounts.js';
-import { isValidStatus, type AccountStatus } from '../../domain/account-fsm.js';
+import {
+  canTransition,
+  isValidStatus,
+  type AccountStatus,
+} from '../../domain/account-fsm.js';
 
-/** 简单的网关客户端实现（通过 HTTP 调用网关模拟器）。 */
+/**
+ * 网关客户端实现：只走题面正式路径（connect / disconnect）。
+ * /_mock/* 是模拟器私有端点，后端一律不得调用（隔离约束，规划 01 §3.5）。
+ */
 class HttpGatewayClient implements GatewayClient {
   constructor(private readonly gatewayUrl: string) {}
 
@@ -34,42 +48,6 @@ class HttpGatewayClient implements GatewayClient {
     if (!res.ok) {
       const body = await res.text();
       throw new Error(`网关 disconnect 失败: ${res.status} ${body}`);
-    }
-  }
-
-  async suspend(accountId: string, opts: { pushAccountStatus?: boolean } = {}): Promise<void> {
-    const res = await fetch(`${this.gatewayUrl}/_mock/accounts/${accountId}/suspend`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ pushAccountStatus: opts.pushAccountStatus ?? true }),
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`网关 suspend 失败: ${res.status} ${body}`);
-    }
-  }
-
-  async sessionExpire(accountId: string, opts: { pushAccountStatus?: boolean } = {}): Promise<void> {
-    const res = await fetch(`${this.gatewayUrl}/_mock/accounts/${accountId}/session-expire`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ pushAccountStatus: opts.pushAccountStatus ?? true }),
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`网关 session-expire 失败: ${res.status} ${body}`);
-    }
-  }
-
-  async setRateLimit(accountId: string, retryAfterSeconds: number): Promise<void> {
-    const res = await fetch(`${this.gatewayUrl}/_mock/accounts/${accountId}/set-rate-limit`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ retryAfterSeconds }),
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`网关 set-rate-limit 失败: ${res.status} ${body}`);
     }
   }
 }
@@ -112,18 +90,12 @@ export async function registerAccountRoutes(
     '/api/accounts/:id/connect',
     async (request: FastifyRequest<{ Params: AccountParams }>) => {
       const { id: accountId } = request.params;
-      try {
-        const result = await accountService.connect(accountId);
-        return {
-          status: 'online',
-          platformUserId: result.platformUserId,
-        };
-      } catch (err) {
-        if (err instanceof Error && err.message.includes('终态')) {
-          throw AppError.forbidden(err.message);
-        }
-        throw err;
-      }
+      // 终态时 service 抛 401/403 AppError，由全局 errorHandler 统一序列化
+      const result = await accountService.connect(accountId);
+      return {
+        status: 'online',
+        platformUserId: result.platformUserId,
+      };
     },
   );
 
@@ -132,16 +104,15 @@ export async function registerAccountRoutes(
     '/api/accounts/:id/transition',
     async (request: FastifyRequest<{ Params: AccountParams; Body: TransitionBody }>) => {
       const { id: accountId } = request.params;
-      const body = request.body;
+      const body = request.body ?? {};
 
-      // 校验请求体
+      // 1) 必填字段
       if (body.to === undefined || body.expectedFrom === undefined) {
         throw AppError.badRequest('缺少必填字段: to, expectedFrom');
       }
-
       const { to, expectedFrom } = body;
 
-      // 校验状态值合法性
+      // 2) 状态值合法性
       if (!isValidStatus(to)) {
         throw AppError.badRequest(`非法的目标状态: ${to}`);
       }
@@ -149,13 +120,34 @@ export async function registerAccountRoutes(
         throw AppError.badRequest(`非法的当前状态: ${expectedFrom}`);
       }
 
-      // 获取当前账号
+      // 3) 自环（to === expectedFrom）非法：转移表没有任何同状态出边
+      if (to === expectedFrom) {
+        throw AppError.conflict(
+          ErrorCode.ILLEGAL_TRANSITION,
+          `非法状态转移：${expectedFrom} → ${to}（不允许转移到相同状态）`,
+        );
+      }
+
+      // 4) rate_limited 只能由网关 429 触发，不接受操作员手动设置
+      if (to === 'rate_limited') {
+        throw AppError.badRequest('rate_limited 状态由网关 429 触发，不能手动设置');
+      }
+
+      // 5) 转移表判定
+      if (!canTransition(expectedFrom, to)) {
+        throw AppError.conflict(
+          ErrorCode.ILLEGAL_TRANSITION,
+          `非法状态转移：${expectedFrom} → ${to}`,
+        );
+      }
+
+      // 6) 账号必须存在
       const account = await accountService.getByAccountId(accountId);
       if (account === undefined) {
         throw AppError.notFound(`账号 ${accountId} 不存在`);
       }
 
-      // 校验 expectedFrom 是否匹配
+      // 7) expectedFrom 必须与当前状态一致（CAS version 更新是最终兜底）
       if (account.status !== expectedFrom) {
         throw AppError.conflict(
           ErrorCode.CAS_CONFLICT,
@@ -163,56 +155,35 @@ export async function registerAccountRoutes(
         );
       }
 
-      // 执行转移
+      // 执行转移（service 内部负责网关副作用、CAS、事件入队）
       try {
-        let newStatus: AccountStatus;
-
-        switch (to) {
+        switch (to as AccountStatus) {
           case 'online':
-            // 如果已在线，幂等返回
-            if (account.status === 'online') {
-              return { status: 'online' };
-            }
             await accountService.connect(accountId);
-            newStatus = 'online';
             break;
-
           case 'disconnected':
             await accountService.disconnect(accountId);
-            newStatus = 'disconnected';
             break;
-
           case 'idle':
-            // idle 需要通过 disconnect 实现（如果当前是 online）
-            if (account.status === 'online' || account.status === 'rate_limited') {
-              await accountService.disconnect(accountId);
-            }
-            // TODO: 如果需要直接设置为 idle，需要添加专门的转移方法
-            newStatus = 'idle';
+            // online → idle 内部会调网关 disconnect；disconnected → idle 纯本地
+            await accountService.goIdle(accountId);
             break;
-
           case 'suspended':
             await accountService.suspend(accountId);
-            newStatus = 'suspended';
             break;
-
           case 'session_expired':
             await accountService.sessionExpire(accountId);
-            newStatus = 'session_expired';
             break;
-
-          case 'rate_limited':
-            // rate_limited 通常由网关 429 触发，手动设置需要 retryAfterSeconds
-            throw AppError.badRequest('rate_limited 状态不能手动设置，由网关 429 触发');
-
           default:
+            // rate_limited 已在上面拦截，其余合法值均已覆盖
             throw AppError.badRequest(`不支持的目标状态: ${to}`);
         }
 
-        return { status: newStatus };
+        return { status: to };
       } catch (err) {
         if (err instanceof AppError) throw err;
         if (err instanceof Error) {
+          // CAS 重试耗尽期间状态漂移等兜底映射
           if (err.message.includes('非法状态转移')) {
             throw AppError.conflict(ErrorCode.ILLEGAL_TRANSITION, err.message);
           }

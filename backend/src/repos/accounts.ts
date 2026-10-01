@@ -119,17 +119,4 @@ export class AccountRepo {
     if (existing === undefined) throw new Error(`账号 ${accountId} 创建失败且不存在`);
     return existing;
   }
-
-  /**
-   * 清除过期的限流状态：rate_limited_until < now() 的账号改回 online（网关侧也会自动恢复）。
-   * 返回恢复的账号数。后台 sweep 定期调用。
-   */
-  async sweepExpiredRateLimits(): Promise<number> {
-    const { rowCount } = await this.pool.query(
-      `UPDATE accounts
-       SET status = 'online', rate_limited_until = NULL, retry_after_seconds = NULL, version = version + 1, updated_at = now()
-       WHERE status = 'rate_limited' AND rate_limited_until < now()`,
-    );
-    return rowCount ?? 0;
-  }
 }

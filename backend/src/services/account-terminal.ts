@@ -14,6 +14,7 @@
 import type { Pool, PoolClient } from 'pg';
 import type { AccountStatus } from '../domain/account-fsm.js';
 import { isTerminal } from '../domain/account-fsm.js';
+import { enqueueWebEvent } from '../repos/web-events.js';
 
 /** 终态来源：用于日志追踪，不影响行为。 */
 export type TerminalSource = 'send_error' | 'gateway_event' | 'operator' | 'agent';
@@ -129,12 +130,8 @@ export async function markTerminal(
       [accountUuid],
     );
 
-    // 5) 入队 web_events
-    await client.query(
-      `INSERT INTO web_events (type, payload)
-       VALUES ('account_terminal', $1)`,
-      [JSON.stringify({ accountId, status: toStatus, source })],
-    );
+    // 5) 入队 web_events（与本事务同提交，INV-5）
+    await enqueueWebEvent(client, 'account_terminal', { accountId, status: toStatus, source });
 
     await client.query('COMMIT');
 
