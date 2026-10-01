@@ -15,6 +15,117 @@
 | 前端 | React 18 + TypeScript + Vite（nginx 伺服 + 反代 /api、/ws） |
 | 部署 | docker-compose 一键启动 |
 
+## 架构设计
+
+### 总览
+
+```
+                         浏览器控制台 (React 18 + Vite)
+                                   │  REST (/api) ＋ WebSocket (/ws)
+                         Fastify HTTP 层（路由 / 鉴权 / 统一错误契约）
+                                   │
+        ┌──────────────────────────┴───────────────────────────┐
+        │                    services 编排层                    │
+        │   事务边界 · 状态机推进 · 外部调用 · Agent 主循环      │
+        └──────────────────────────┬───────────────────────────┘
+                                   │ （SQL 只出现在这一层之下）
+                              repos 仓储层
+                                   │
+                            PostgreSQL 16  ◄──── 唯一事实来源 / 并发协调点
+                                   ▲
+   10 个后台 workers（轮询 DB，状态全程持久化，崩溃后从 DB 恢复）：
+     event-consumer · outbox-sender · reconcile-504 · rate-limit-sweeper
+     group-job · leave-all-job · agent-runner-worker · sequence-runner-worker
+     ws-publisher · media-cleaner
+                                   │
+              消息网关模拟器 (HTTP+SSE)    Agent 服务模拟器 (tool-use 协议)
+```
+
+**核心架构取舍**
+
+- **单进程单体**：HTTP 服务与全部 worker 同进程协作，通过数据库传递状态，无内存队列作为可靠性依赖。
+- **PostgreSQL 既是唯一事实来源，也是多实例协调点**：多实例并发不靠分布式锁服务，而用数据库原语——
+  partial unique index（互斥）、`pg_advisory_lock`（临界区）、`FOR UPDATE SKIP LOCKED`（工作认领）、聚合根 `version`（CAS 乐观锁）。
+- **一切异步状态持久化**：worker 只做「读 DB → 推进一小步 → 写 DB」，无内存定时器作为崩溃恢复依据；
+  进程任意时刻重启，均从数据库重建现场（题面总则：任意重启前后行为都成立）。
+- **严格分层**：`domain/`（纯业务逻辑，如 6×6 状态转移表，无 IO）→ `repos/`（SQL 唯一出处）→
+  `services/`（事务与编排）→ `http/`（路由/鉴权）→ `workers/`（后台循环）。
+
+### 核心事务一致性处理
+
+**1. 出站：事务性发件箱（Transactional Outbox）**
+消息受理时先在事务内写 `outbox_messages`（`client_msg_id` 由后端生成 UUID，先于任何 HTTP 调用持久化），
+再由 `OutboxSender` 用 `FOR UPDATE SKIP LOCKED` 短事务认领、调网关，按响应以 CAS 推进状态。
+因此不可能出现「网关已发出而库里无记录」，也不可能「一行记录对应网关多条消息」。
+见 [outbox-sender.ts](file:///home/ubuntu/multi-account-message-platform/backend/src/workers/outbox-sender.ts)。
+
+**2. 504 未知态收敛**
+收到 504 时，同一事务内置 `delivery_status='unknown'` 并写入 `pending_reconciliations`（持久化定时任务，而非内存定时器）。
+收敛 worker 到期用 by-client-id 查询：已落地 → 回填 `accepted`；确认未发出 → `prepareResend` 先 CAS 落库
+（`resend_count+1`/`generation+1`）再用同一 `clientMsgId` 重发，**至多重发一次**；查询不可用保持 `unknown` 退避重试。
+从收到 504 起 5 秒内必为 `accepted`/`sent`/`failed` 之一。见
+[reconcile-504.ts](file:///home/ubuntu/multi-account-message-platform/backend/src/workers/reconcile-504.ts)。
+
+**3. 入站：收件箱 + 游标（Inbox Pattern）**
+SSE 每一帧在同一事务内 `INSERT events_inbox ON CONFLICT DO NOTHING`（eventId 主键去重）并推进 `events_cursor`。
+独立的消费循环逐条在独立事务内 dispatch，成功才置 `processed_at`；失败则 `attempts+1`、记录 `last_error`
+并入队 `inconsistency` 前端事件，**不中断后续事件**。断流/停机期间的事件靠 SSE 独占语义
+（`since=last_seen_event_id`）重连补拉，不会遗漏。见
+[event-consumer.ts](file:///home/ubuntu/multi-account-message-platform/backend/src/workers/event-consumer.ts)。
+
+**4. 账号终态原子后果**
+进入 `suspended`/`session_expired` 时，`markTerminal` 用单个事务完成「CAS 进终态 → 移出所有群 →
+排队中发送置 `cancelled`(failCode=ACCOUNT_TERMINAL) → 对应序列步骤置 `skipped` → 入队 `account_terminal` 事件」，
+要么全部生效要么全部不生效；发送错误、网关事件、操作员标记、Agent 四种来源共用同一函数。
+群不可写（`GROUP_WRITE_FORBIDDEN`）同理：群置 `unreachable`、停运行中序列、消息置 failed 也在同事务原子完成。见
+[account-terminal.ts](file:///home/ubuntu/multi-account-message-platform/backend/src/services/account-terminal.ts)。
+
+**5. 前端事件事务化（INV-5）**
+所有面向前端的通知写入 `web_events`（BIGSERIAL 全局单调 seq），且必须在**业务事务内**插入——
+因此推给前端的状态事件必定对应已提交的状态，不会推送幻觉状态。`WsPublisher` 轮询该表广播并推进推送游标；
+客户端断线重连带 `sinceSeq` 直接从库补发，断线期间事件不丢不重。见
+[web-events.ts](file:///home/ubuntu/multi-account-message-platform/backend/src/repos/web-events.ts)。
+
+**6. Agent 崩溃恢复与幂等**
+Agent 的对话块（`agent_run_messages`）、每一步（`agent_steps`）、工具调用记录（`agent_tool_calls`）全程持久化。
+重启续跑时重建对话历史，并检查末尾是否有未配对的 assistant tool_use：按工具调用状态判定——
+`executed` → 查 outbox 回填结果；`pending_execution` 且 outbox 已存在 → 补标记后回填；无记录 → 才重放执行。
+**已对外生效的调用绝不重放**。同一 run 内相同 `idempotency_key` 的 send_message 二次调用直接返回该消息当前状态，
+不再审计、不再发送。见
+[agent-runner.ts](file:///home/ubuntu/multi-account-message-platform/backend/src/services/agent-runner.ts)。
+
+**7. 多实例并发控制（数据库原语）**
+
+| 机制 | 用途 |
+|---|---|
+| partial unique index `... WHERE status='running'` | 同一群至多一个 running 的 agent run / 序列 run，DB 级兜底 |
+| `pg_try_advisory_lock(hashtext(id))` | 建群 job、序列 run 等 worker 临界区互斥，拿不到锁即跳过 |
+| `FOR UPDATE SKIP LOCKED` | outbox 消息的多实例工作认领 |
+| 聚合根 `version` + CAS UPDATE | accounts/groups/outbox/run 的并发变更，后写不覆盖先写，冲突方可重试或跳过 |
+
+### 需求关注点实现对照
+
+题面 `docs/examination_project.md` 的关键关注点及其落点：
+
+| 关注点 | 实现方式 |
+|---|---|
+| A0 迁移可重复 / schema 门禁 | 自研迁移框架：单事务 + advisory lock 串行化；启动只校验不执行 DDL，版本不一致拒绝启动 |
+| A0 错误契约 / viewer 只读 | 统一 `{error:{code,message,requestId}}`；RBAC 钩子在路由层拦截，viewer 写操作一律 403 |
+| A1 账号状态机 | 6×6 转移表在 `domain/account-fsm.ts` 纯枚举（单测全表覆盖）；手动转移 `expectedFrom` CAS，冲突返 409 |
+| A1 限流自动恢复 | 429 置 `rate_limited` + `rate_limited_until`，排队消息保持 `queued`；sweeper 周期扫描到期自动回 online |
+| A2 错误码处理 | `DeliveryService` 按网关码统一分发：限流/终态/群不可写/消息级失败/504，各有确定后果 |
+| A3 异步建群 | create→invite→join→promote 状态化推进；JOIN_TIMEOUT（10s）判定；promote 遇 NOT_MEMBER_YET 至多 2 次 |
+| A4 时间线 / WS | 游标分页按 `(sent_at DESC, msg_id DESC)`，并发写入下不重不漏；WS 帧 seq 单调、sinceSeq 补发 |
+| A5 预算与协议错误 | 上限 12 步 / 60s（`accumulated_ms` 持久化，停机时间不计）/ 连续 3 协议错误；turn 超时记 TURN_TIMEOUT |
+| A5 审计 | send/kick 执行前审计；error/超时最多 3 次（不计步），3 次未果 → run blocked(audit_blocked) |
+| A5 两类协议错误 | 未知工具/入参不合 schema：追加 is_error tool_result；坏 JSON/重复 id/超时：追加 PROTOCOL_ERROR 文本步 |
+| B1 定时序列 | 黏性变量（stepVars 步进覆盖、空串不改）；启动前全步占位符预检，不通过 422 且一条不发 |
+| B1 排期与重启 | 以 `message_sent` 落地为「发出」排下一步；重启只重排最早过期步，不会一次性全发 |
+| B2 群生命周期 | INVITE_NOT_READY/EXPIRED/ALREADY_MEMBER 分别处理；leave-all 非群主先退、群主最后退，失败记 errors[] 且 DB 与网关成员保持一致 |
+| B3 会话 | refresh token 仅 HttpOnly cookie、每次轮换；复用旧 token → 401 并作废整个会话；logout 使 access token 立即失效；前端 single-flight 续期 |
+| C1 媒体 | 5s 超时 / 10MB 上限 / UUID 文件名防穿越 / `.tmp`+rename 原子落盘；清理按下载时刻判龄，running run 关联文件受保护 |
+| C2 真实 LLM | 统一 AgentClient 接口：Anthropic Messages 直通；OpenAI Chat 完成 tool_calls 双向转换，改 provider 即切换 |
+
 ## 一键启动
 
 前提：已安装 Docker 与 docker compose 插件（v2）。
