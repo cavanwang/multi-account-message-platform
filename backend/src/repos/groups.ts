@@ -117,6 +117,70 @@ export class GroupRepo {
   }
 
   /**
+   * 按网关群 ID 查群（事件消费：事件里的 groupId 是网关文本 ID，需映射到聚合根 UUID）。
+   * 可在调用方事务内调用（传 client）。
+   */
+  async findByGatewayGroupId(
+    gatewayGroupId: string,
+    client?: PoolClient,
+  ): Promise<GroupRow | undefined> {
+    const executor = client ?? this.pool;
+    const { rows } = await executor.query<DbGroupRow>(
+      'SELECT * FROM groups WHERE gateway_group_id = $1',
+      [gatewayGroupId],
+    );
+    return rows[0] !== undefined ? fromDbGroup(rows[0]) : undefined;
+  }
+
+  /**
+   * 判断 platformUserId 是否为该群的**服务账号成员**（message 事件的 isOwn 判定）。
+   * sender 是外部用户时无此记录 → false。
+   */
+  async isMemberByPlatformUserId(
+    client: PoolClient,
+    groupId: string,
+    platformUserId: string,
+  ): Promise<boolean> {
+    const { rowCount } = await client.query(
+      'SELECT 1 FROM group_members WHERE group_id = $1 AND platform_user_id = $2',
+      [groupId, platformUserId],
+    );
+    return (rowCount ?? 0) > 0;
+  }
+
+  /**
+   * 添加成员（member_joined 事件；幂等：PK 冲突忽略）。
+   */
+  async addMember(
+    client: PoolClient,
+    groupId: string,
+    accountId: string,
+    platformUserId: string,
+    role: MemberRole = 'member',
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO group_members (group_id, account_id, platform_user_id, role)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (group_id, account_id) DO NOTHING`,
+      [groupId, accountId, platformUserId, role],
+    );
+  }
+
+  /**
+   * 按 platformUserId 移除群成员（member_left 事件；不存在时静默忽略）。
+   */
+  async removeMemberByPlatformUserId(
+    client: PoolClient,
+    groupId: string,
+    platformUserId: string,
+  ): Promise<void> {
+    await client.query(
+      'DELETE FROM group_members WHERE group_id = $1 AND platform_user_id = $2',
+      [groupId, platformUserId],
+    );
+  }
+
+  /**
    * 判断账号是否为群成员（切片 3 send 端点的成员校验）。
    * 群不存在时同样返回 false（不存在的群自然没有成员）。
    */

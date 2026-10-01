@@ -56,6 +56,18 @@ export class AccountRepo {
     return rows[0] !== undefined ? fromDb(rows[0]) : undefined;
   }
 
+  /**
+   * 按平台用户 ID 反查账号（member_joined 事件：platformUserId → 服务账号）。
+   * 外部用户无对应账号 → undefined。
+   */
+  async findByPlatformUserId(platformUserId: string): Promise<AccountRow | undefined> {
+    const { rows } = await this.pool.query<DbAccountRow>(
+      'SELECT * FROM accounts WHERE platform_user_id = $1',
+      [platformUserId],
+    );
+    return rows[0] !== undefined ? fromDb(rows[0]) : undefined;
+  }
+
   async list(): Promise<AccountRow[]> {
     const { rows } = await this.pool.query<DbAccountRow>('SELECT * FROM accounts ORDER BY account_id');
     return rows.map(fromDb);

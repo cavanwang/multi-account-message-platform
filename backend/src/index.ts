@@ -16,6 +16,7 @@ import { buildServer } from './http/server.js';
 import { RateLimitSweeper } from './workers/rate-limit-sweeper.js';
 import { OutboxSender } from './workers/outbox-sender.js';
 import { Reconcile504Worker } from './workers/reconcile-504.js';
+import { EventConsumer } from './workers/event-consumer.js';
 import { HttpSendGateway, HttpQueryGateway } from './services/gateway-client.js';
 
 async function main(): Promise<void> {
@@ -80,6 +81,15 @@ async function main(): Promise<void> {
   );
   reconcileWorker.start();
 
+  // 后台 worker：事件消费（SSE 事件入 inbox + 幂等消费，INV-4）
+  const eventConsumer = new EventConsumer(
+    pool,
+    config.gatewayUrl,
+    app.log.child({ worker: 'event-consumer' }),
+    { batchSize: 50, intervalMs: 200, reconnectBaseMs: 500, reconnectMaxMs: 5000 },
+  );
+  eventConsumer.start();
+
   // --- 优雅退出 ---
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -90,6 +100,7 @@ async function main(): Promise<void> {
       rateLimitSweeper.stop();
       outboxSender.stop();
       reconcileWorker.stop();
+      eventConsumer.stop();
       await app.close();
       await closePool();
       process.exit(0);
